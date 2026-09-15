@@ -153,6 +153,98 @@ At runtime, inside a session:
 For a compile-time attribution of what is still large, install `cargo-bloat`
 and run it against the built binary.
 
+## Building on a resource-constrained host
+
+The `tiny` profile is the **most memory-hungry** build this repo offers: fat LTO
+with a single codegen unit forces the final `jcode` binary's link step to hold
+the whole program at once, and the largest single rustc unit (`jcode-base`)
+peaks around 1.6 GiB RSS on its own. Budget accordingly before starting on a
+small machine.
+
+### 0. Check what the build wrapper will do first
+
+Always build through `scripts/dev_cargo.sh` (which `scripts/build_tiny.sh` uses)
+rather than bare `cargo`. It sizes the job count from *currently available*
+memory, picks a fast linker, and takes a build lock so parallel builds on the
+same host do not stampede into OOM:
+
+```bash
+scripts/dev_cargo.sh --print-setup
+```
+
+`build_jobs_status` shows the chosen job count and the available-memory figure it
+was derived from. The default budget is 1792 MiB per job; override it with
+`JCODE_BUILD_MIB_PER_JOB` if your machine is tighter.
+
+### 1. On-device build
+
+```bash
+export JCODE_DEV_FEATURE_PROFILE=minimal   # drop ONNX/AWS/PDF dependency stacks
+export JCODE_BUILD_JOBS=1                  # force serial rustc if in doubt
+scripts/build_tiny.sh
+```
+
+Also make sure there is **swap** (a `zram` device or a swapfile on Linux) and
+enough disk: the `minimal` feature set still writes ~1.6 GB into `target/tiny`.
+Reclaim space with `scripts/clean_target.sh` (dry-run by default; `--apply`
+removes regenerable cross-compile caches).
+
+### 2. If the fat-LTO link OOMs
+
+The profile settings are plain Cargo config, so they can be overridden from the
+environment without editing `Cargo.toml`:
+
+```bash
+# Thin LTO and more codegen units: much lower peak memory, somewhat larger binary.
+CARGO_PROFILE_TINY_LTO=thin CARGO_PROFILE_TINY_CODEGEN_UNITS=16 scripts/build_tiny.sh
+```
+
+Or step all the way back to an existing profile and keep only the reduced
+feature set, which is where most of the size win actually comes from:
+
+```bash
+JCODE_TINY_PROFILE=release-lto scripts/build_tiny.sh   # thin LTO
+JCODE_TINY_PROFILE=release     scripts/build_tiny.sh   # no LTO, fastest build
+```
+
+### 3. Or build somewhere else and copy the binary back
+
+If the device cannot host the build at all, offload it. `scripts/remote_build.sh`
+rsyncs the tree to a remote SSH host, builds there, and syncs the binary back;
+it understands `--profile <name>`, so it works with `tiny`:
+
+```bash
+mkdir -p ~/.config/jcode
+cat > ~/.config/jcode/remote-build.env <<'EOF'
+JCODE_REMOTE_HOST=mybuilder
+EOF
+
+JCODE_DEV_FEATURE_PROFILE=minimal JCODE_BUILD_JOBS=1 \
+    scripts/remote_build.sh --profile tiny -p jcode --bin jcode
+```
+
+`dev_cargo.sh` can also do this transparently: set `JCODE_REMOTE_CARGO=1` (in the
+same env file or the shell) and every build, including
+`scripts/build_tiny.sh`, is offloaded, falling back to local cargo when the host
+is unreachable.
+
+The remote host must be the **same platform** as the device, since the artifact
+is copied over and executed directly. For a different platform, cross-compile
+instead (see issue #1078 for the `zigbuild`-style Raspberry Pi case).
+
+### 4. Repeat builds
+
+Non-incremental profiles are the ones sccache can actually accelerate:
+`scripts/build_tiny.sh` runs with `incremental = false`, so the wrapper enables
+sccache when it is available. Keep it on for iterative work on a slow host, and
+reuse the same `target/` directory between runs.
+
+### Realistic expectations
+
+~16 minutes on a 10-core Apple Silicon host *throttled to a single job* by memory
+pressure. A 4-core single-board computer is in the hours range, and the link step
+is the part most likely to fail first.
+
 ## What this does *not* shrink
 
 - **The client/server split.** The TUI still needs the long-lived
