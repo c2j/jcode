@@ -25,6 +25,11 @@ touch "${JCODE_HOME:-$HOME/.jcode}/no_telemetry"
 ./target/tiny/jcode --no-update
 ```
 
+The result lands at `target/tiny/jcode`. It is **not** `target/debug/jcode` or
+`target/release/jcode`; those are separate profiles and are left untouched by
+`build_tiny.sh`. If you have an old debug build around, it will still be hundreds
+of megabytes and is not what the tiny build produced.
+
 If you do not want the reduced runtime config, the build alone is still useful:
 
 ```bash
@@ -74,6 +79,38 @@ The interactive hot-path crates (`ratatui` family, `crossterm`, `unicode-*`,
 `jcode-tui-anim`, `jcode-fuzzy`) are pinned back to `opt-level = 3` inside the
 profile, matching the existing dev/selfdev/test pins, because at `opt-level = "z"`
 the per-frame render loop and fuzzy picker feel visibly laggy.
+
+### Low-memory hosts
+
+Fat LTO builds the whole program in a single LLVM module, so its peak memory is
+set by total IR volume and **cannot** be lowered by reducing Cargo's job count:
+the final `jcode(bin)` crate is one rustc unit. It peaks at ~2.6 GiB of rustc RSS
+(measured on aarch64 with the `minimal` feature set).
+
+If the host has less RAM than that, the build does not fail fast, it thrashes
+swap. Measured on a 215 MiB ppc64 host (a PlayStation 3 running Linux), the final
+step ran for **~63 hours** before producing a correct binary, with ~2.8 GiB
+swapped out and ~87% of its CPU time in the kernel.
+
+`scripts/dev_cargo.sh` checks installed RAM for the fat-LTO profiles and applies:
+
+| Installed RAM | Behavior |
+|---|---|
+| >= 4096 MiB | keep fat LTO |
+| 1024-4096 MiB | keep fat LTO, warn with the measured numbers |
+| < 1024 MiB | downgrade to ThinLTO + 256 codegen units |
+
+The downgrade is not free. At `opt-level = "z"` most of the size win is
+whole-program dead-code elimination, so ThinLTO gives back a lot of it: on the
+aarch64 reference host, fat LTO produces 24.6 MiB and ThinLTO + 16 units produces
+42 MiB (**+71%**). That is why the fallback only triggers automatically on hosts
+that are too small to run fat LTO at all.
+
+Controls: `JCODE_LOW_MEMORY_LTO=auto|thin|off` (default `auto`),
+`JCODE_LTO_MIN_MIB` (default 1024), `JCODE_LTO_WARN_MIB` (default 4096), or an
+explicit `CARGO_PROFILE_TINY_LTO=<mode>`. A small host that wants the smallest
+binary and is willing to wait can force fat LTO with
+`JCODE_LOW_MEMORY_LTO=off`.
 
 ### `panic = "abort"` tradeoff
 
@@ -136,6 +173,12 @@ Build time for the tiny profile was ~16 minutes on a 10-core machine, but the
 memory-aware job sizing in `scripts/dev_cargo.sh` throttled it to a single rustc
 job because the host was under memory pressure; on an unloaded machine it is
 faster.
+
+The same fat-LTO `tiny` + `minimal` build on a ppc64 host (PlayStation 3,
+215 MiB RAM) produced a **34,662,880 B (34.7 MB)** stripped binary. It is larger
+than aarch64 because of the PowerPC ISA, not because the profile did not apply.
+The final `jcode(bin)` LTO step took **~63 hours** on that host because it
+thrashed swap; see [Low-memory hosts](#low-memory-hosts).
 
 ## Measuring the result
 

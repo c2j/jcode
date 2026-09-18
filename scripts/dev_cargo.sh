@@ -419,6 +419,31 @@ available_memory_kib() {
   printf '%s\n' "$value"
 }
 
+# Installed RAM, used to decide whether a fixed-size whole-program LTO working
+# set can ever fit. Unlike MemAvailable this does not flap with transient load,
+# which matters because the LTO decision is about the machine's capacity, not
+# about what happens to be free this second.
+total_memory_kib() {
+  local value
+  case "$(uname -s)" in
+    Linux)
+      [[ -r /proc/meminfo ]] || return 1
+      value=$(meminfo_kib MemTotal)
+      ;;
+    Darwin)
+      command -v sysctl >/dev/null 2>&1 || return 1
+      value=$(sysctl -n hw.memsize 2>/dev/null) || return 1
+      [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || return 1
+      value=$(( value / 1024 ))
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || return 1
+  printf '%s\n' "$value"
+}
+
 selfdev_low_memory_default_needed() {
   [[ "$(uname -s)" == "Linux" ]] || return 1
   [[ -r /proc/meminfo ]] || return 1
@@ -591,6 +616,134 @@ maybe_configure_low_memory_selfdev() {
   export SCCACHE_DISABLE="${SCCACHE_DISABLE:-1}"
   selfdev_low_memory_status="enabled:incremental=${CARGO_PROFILE_SELFDEV_INCREMENTAL},codegen-units=${CARGO_PROFILE_SELFDEV_CODEGEN_UNITS}"
   log "using low-memory selfdev overrides (${selfdev_low_memory_status#enabled:})"
+}
+
+# Fat LTO merges the whole program into one LLVM module, so its peak memory
+# scales with total IR volume and is *not* reducible by lowering Cargo's job
+# count: the final bin crate is a single rustc unit. Measured here: the `tiny`
+# jcode bin peaks at ~2.6 GiB of rustc RSS (aarch64, `minimal` features).
+#
+# On a host that cannot hold that working set the build does not fail fast. It
+# thrashes swap, because the live set is rewritten every instant. Observed on a
+# 215 MiB ppc64 host: the `tiny` build sat at 626/627 for days with ~2.8 GiB
+# swapped out and ~87% of its CPU time in the kernel; it eventually produced a
+# correct binary, but took ~63 hours to do so.
+#
+# The fallback is ThinLTO with several codegen units, whose per-partition
+# working set is bounded and which parallelizes (`codegen-units` must be > 1 or
+# ThinLTO gets a single partition and the memory problem returns). It is *not*
+# free: at `opt-level = "z"` whole-program dead-code elimination is most of the
+# size win, so downgrading costs a lot of size. Measured on the same aarch64
+# host: fat = 24.6 MiB, thin + 16 units = 42 MiB (+71%). That is why this does
+# not downgrade silently on merely-small machines.
+#
+# Policy (auto):
+#   - installed RAM >= JCODE_LTO_WARN_MIB (default 4096): keep fat, say nothing.
+#   - JCODE_LTO_MIN_MIB <= RAM < WARN (default min 1024): keep fat, but warn
+#     with the measured numbers and the exact opt-in command.
+#   - RAM < JCODE_LTO_MIN_MIB: downgrade to thin automatically. At this size
+#     fat LTO is a multi-day non-terminating build, so a larger binary is the
+#     lesser evil. This is logged loudly.
+#
+# Controls:
+#   JCODE_LOW_MEMORY_LTO=auto|thin|off  (default auto)
+#   JCODE_LTO_MIN_MIB=<n>               (default 1024; below this, downgrade)
+#   JCODE_LTO_WARN_MIB=<n>              (default 4096; below this, warn)
+#   CARGO_PROFILE_TINY_LTO=<mode>       (explicit override always wins)
+low_memory_lto_status="disabled"
+
+maybe_configure_low_memory_lto() {
+  local profile
+  profile=$(selected_profile "$@")
+  case "$profile" in
+    tiny|release-lto) ;;
+    *)
+      low_memory_lto_status="not-lto-profile"
+      return 0
+      ;;
+  esac
+
+  # The profile's own LTO setting. Only fat LTO has the unbounded working set.
+  local default_lto
+  case "$profile" in
+    tiny) default_lto="fat" ;;
+    *) default_lto="thin" ;;
+  esac
+  if [[ "$default_lto" != "fat" ]]; then
+    low_memory_lto_status="not-fat-lto"
+    return 0
+  fi
+
+  local upper lto_env
+  upper=$(printf '%s' "$profile" | tr 'a-z-' 'A-Z_')
+
+  # Respect an explicit per-profile LTO override from the caller.
+  lto_env="CARGO_PROFILE_${upper}_LTO"
+  if [[ -n "${!lto_env:-}" ]]; then
+    low_memory_lto_status="external:${!lto_env}"
+    return 0
+  fi
+
+  local mode="${JCODE_LOW_MEMORY_LTO:-auto}"
+  case "$mode" in
+    auto|"") mode="auto" ;;
+    1|true|yes|on|force|thin) mode="thin" ;;
+    0|false|no|off|never) mode="off" ;;
+    *)
+      printf 'error: unsupported JCODE_LOW_MEMORY_LTO=%s (expected auto|thin|off)\n' "$mode" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ "$mode" == "off" ]]; then
+    low_memory_lto_status="disabled-by-env"
+    return 0
+  fi
+
+  local mem_total_kib
+  if ! mem_total_kib=$(total_memory_kib); then
+    low_memory_lto_status="unknown-memory"
+    return 0
+  fi
+
+  local min_mib="${JCODE_LTO_MIN_MIB:-1024}"
+  [[ "$min_mib" =~ ^[0-9]+$ && "$min_mib" -ge 512 ]] || min_mib=1024
+  local warn_mib="${JCODE_LTO_WARN_MIB:-4096}"
+  [[ "$warn_mib" =~ ^[0-9]+$ && "$warn_mib" -ge 512 ]] || warn_mib=4096
+  (( warn_mib < min_mib )) && warn_mib="$min_mib"
+
+  local mem_total_mib=$(( mem_total_kib / 1024 ))
+
+  if [[ "$mode" == "auto" ]] && (( mem_total_mib >= warn_mib )); then
+    low_memory_lto_status="ok:fat (mem_total=${mem_total_mib}MiB >= ${warn_mib}MiB)"
+    return 0
+  fi
+
+  if [[ "$mode" == "auto" ]] && (( mem_total_mib >= min_mib )); then
+    low_memory_lto_status="warn:fat (mem_total=${mem_total_mib}MiB < ${warn_mib}MiB)"
+    log "warning: this host has ${mem_total_mib}MiB RAM, but fat LTO (the 'tiny' profile) peaks around 2.6GiB and will swap heavily; the build may take many hours to days"
+    log "warning: to trade binary size for build time, re-run with JCODE_LOW_MEMORY_LTO=thin (measured: +71% binary size)"
+    return 0
+  fi
+
+  # Auto-downgrade on a hopeless host, or an explicit JCODE_LOW_MEMORY_LTO=thin.
+  # Raise the codegen-unit count so ThinLTO actually gets partitions to work
+  # through; the smallest hosts get the maximum partition count.
+  local cgu=16
+  if (( mem_total_mib < 1024 )); then
+    cgu=256
+  fi
+
+  export "CARGO_PROFILE_${upper}_LTO=thin"
+  export "CARGO_PROFILE_${upper}_CODEGEN_UNITS=$cgu"
+  local reason
+  if [[ "$mode" == "thin" ]]; then
+    reason="forced-by-env"
+  else
+    reason="mem_total=${mem_total_mib}MiB < ${min_mib}MiB"
+  fi
+  low_memory_lto_status="thin:${profile} (${reason}, codegen-units=${cgu})"
+  log "low-memory host: downgrading ${profile} LTO fat->thin with codegen-units=${cgu}; fat LTO would need ~2.6GiB and thrash on ${mem_total_mib}MiB of RAM (set JCODE_LOW_MEMORY_LTO=off to force fat anyway)"
 }
 
 # Enable rustc's parallel front-end (`-Zthreads`) for iterative dev/selfdev/test
@@ -770,6 +923,7 @@ os=$(uname -s)
 arch=$(uname -m)
 sccache_status=$sccache_status
 selfdev_low_memory_status=$selfdev_low_memory_status
+low_memory_lto_status=$low_memory_lto_status
 parallel_frontend_status=$parallel_frontend_status
 build_jobs_status=$build_jobs_status
 cargo_build_jobs=${CARGO_BUILD_JOBS:-<unset>}
@@ -1107,6 +1261,7 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
 fi
 
 if [[ "${1:-}" == "--print-setup" ]]; then
+  maybe_configure_low_memory_lto "$@"
   select_build_jobs
   print_setup
   exit 0
@@ -1138,5 +1293,6 @@ acquire_cargo_gate
 # Size the in-process parallelism only after competing jcode Cargo processes
 # have drained. Measuring before the wait would preserve an unnecessarily low
 # one-job decision even after memory becomes available.
+maybe_configure_low_memory_lto "$@"
 select_build_jobs
 run_local_cargo
