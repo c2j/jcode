@@ -41,6 +41,12 @@ terminal for real support rather than assuming, then either confirms the chord
 already works, applies the needed configuration, or explains why configuration
 cannot help.
 
+Inside tmux the same run also writes `set -g allow-passthrough on`. The
+multiplexer that drops extended-key escapes also drops kitty/iTerm2 inline image
+and Mermaid diagram graphics, so both settings belong in the same tmux block.
+The two blocks are tracked independently, so a config written before graphics
+support existed only gets the missing passthrough line appended.
+
 The query matters: writing the activation escape sequence almost always
 "succeeds" even on terminals that ignore it, so
 `supports_modified_enter_reporting` asks the terminal directly (`CSI ? u`

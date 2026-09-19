@@ -1,4 +1,5 @@
-//! Terminal setup for reporting modified Enter (Shift+Enter, Ctrl+Enter).
+//! Terminal setup for reporting modified Enter (Shift+Enter, Ctrl+Enter), plus
+//! the tmux graphics passthrough that inline images and Mermaid diagrams need.
 //!
 //! # Why this exists
 //!
@@ -110,28 +111,63 @@ pub const WEZTERM_CONFIG_LINE: &str = "config.enable_kitty_keyboard = true";
 /// idempotent instead of appending duplicates.
 pub const MANAGED_MARKER: &str = "# jcode: let Shift+Enter reach the application";
 
+/// Marker for the separate graphics block. It is tracked independently of the
+/// keyboard block so users who already configured Shift+Enter still get
+/// passthrough added on a later run.
+pub const GRAPHICS_MARKER: &str = "# jcode: let inline images reach the outer terminal";
+
+/// The tmux setting that lets inline images and Mermaid diagrams through.
+///
+/// tmux strips escape sequences it does not recognize, so kitty/iTerm2 graphics
+/// never reach the outer terminal unless passthrough is enabled. Without it,
+/// Ghostty shows a blank area (or raw base64) where the image should be.
+pub const TMUX_GRAPHICS_BLOCK: &str = "\
+# jcode: let inline images reach the outer terminal.
+# tmux strips unknown escapes, so Ghostty/kitty graphics need passthrough.
+set -g allow-passthrough on
+";
+
 /// Whether `config` already contains jcode's managed tmux block.
 pub fn tmux_config_is_configured(config: &str) -> bool {
     config.contains(MANAGED_MARKER)
         || (config.contains("extended-keys on") && config.contains("csi-u"))
 }
 
-/// The tmux config text after ensuring the managed block is present.
-///
-/// Returns `None` when nothing needs to change, so callers can report "already
-/// configured" without rewriting the file.
-pub fn tmux_config_with_block(existing: &str) -> Option<String> {
-    if tmux_config_is_configured(existing) {
-        return None;
-    }
-    let mut out = existing.to_string();
+/// Whether `config` already enables graphics passthrough for the outer terminal.
+pub fn tmux_graphics_is_configured(config: &str) -> bool {
+    config.contains(GRAPHICS_MARKER) || config.contains("allow-passthrough on")
+}
+
+/// Append `block` to `out`, separating it from existing content with a blank line.
+fn append_tmux_block(out: &mut String, block: &str) {
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
     if !out.is_empty() {
         out.push('\n');
     }
-    out.push_str(TMUX_CONFIG_BLOCK);
+    out.push_str(block);
+}
+
+/// The tmux config text after ensuring every managed block is present.
+///
+/// Returns `None` when nothing needs to change, so callers can report "already
+/// configured" without rewriting the file. The keyboard and graphics blocks are
+/// tracked separately: a user who ran setup before graphics support existed gets
+/// only the graphics block appended, not a duplicate of the keyboard block.
+pub fn tmux_config_with_block(existing: &str) -> Option<String> {
+    let need_keyboard = !tmux_config_is_configured(existing);
+    let need_graphics = !tmux_graphics_is_configured(existing);
+    if !need_keyboard && !need_graphics {
+        return None;
+    }
+    let mut out = existing.to_string();
+    if need_keyboard {
+        append_tmux_block(&mut out, TMUX_CONFIG_BLOCK);
+    }
+    if need_graphics {
+        append_tmux_block(&mut out, TMUX_GRAPHICS_BLOCK);
+    }
     Some(out)
 }
 
@@ -484,9 +520,32 @@ mod tests {
     #[test]
     fn tmux_hand_written_equivalent_config_is_respected() {
         // A user who already configured this by hand should not get a duplicate.
-        let hand_rolled = "set -s extended-keys on\nset -s extended-keys-format csi-u\n";
+        let hand_rolled = "set -s extended-keys on\nset -s extended-keys-format csi-u\n\
+                           set -g allow-passthrough on\n";
         assert!(tmux_config_is_configured(hand_rolled));
+        assert!(tmux_graphics_is_configured(hand_rolled));
         assert!(tmux_config_with_block(hand_rolled).is_none());
+    }
+
+    #[test]
+    fn tmux_graphics_passthrough_is_added_without_duplicating_keyboard_block() {
+        // A config written before graphics support existed already has the
+        // keyboard block; re-running must add only the graphics block.
+        let existing = TMUX_CONFIG_BLOCK;
+        let updated = tmux_config_with_block(existing).expect("should add graphics block");
+        assert_eq!(
+            updated.matches("extended-keys on").count(),
+            1,
+            "keyboard block must not be duplicated: {updated}"
+        );
+        assert!(updated.contains("set -g allow-passthrough on"));
+    }
+
+    #[test]
+    fn tmux_graphics_block_enables_passthrough() {
+        assert!(TMUX_GRAPHICS_BLOCK.contains("set -g allow-passthrough on"));
+        assert!(tmux_graphics_is_configured(TMUX_GRAPHICS_BLOCK));
+        assert!(!tmux_graphics_is_configured("set -g mouse on\n"));
     }
 
     #[test]

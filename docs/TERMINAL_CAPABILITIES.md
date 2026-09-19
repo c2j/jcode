@@ -121,6 +121,37 @@ tmux is the most common source of rendering issues in TUI apps because it interp
 - **TERM mismatch**: If the inner `TERM` doesn't match tmux's advertised capabilities (e.g., app sees `xterm-256color` but tmux only passes `screen-256color`), color/capability negotiation fails silently.
 - **Clipboard**: OSC 52 clipboard support works but must be explicitly enabled (`set -g set-clipboard on`).
 
+### 9. Enabling Inline Images / Mermaid Diagrams Inside tmux
+
+Ghostty, kitty, and WezTerm render jcode's inline images and Mermaid diagrams
+with the kitty graphics protocol. Two things block this inside tmux:
+
+1. **tmux strips the graphics escapes** unless passthrough is enabled. Add to
+   `~/.tmux.conf`:
+
+   ```tmux
+   set -g allow-passthrough on
+   ```
+
+   `/terminal-setup` writes this automatically when run inside tmux.
+
+2. **tmux masks the outer terminal's identity.** `TERM` becomes
+   `tmux-256color` and `TERM_PROGRAM` is rewritten, so jcode's fast,
+   environment-based protocol detection falls back to halfblocks (block
+   characters). Force the authoritative stdio probe instead:
+
+   ```sh
+   export JCODE_MERMAID_PICKER_PROBE=1
+   ```
+
+   The probe asks the terminal directly, which is the only reliable signal
+   behind a multiplexer. It can block for up to two seconds when a terminal does
+   not answer, which is why it is opt-in rather than the default.
+
+The `read` tool's image display asks tmux about its client
+(`tmux display-message -p '#{client_termname}'`) rather than probing, so it needs
+`allow-passthrough on` but not the probe env var.
+
 ---
 
 ## Recommendations for TUI Developers

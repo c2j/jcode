@@ -16,9 +16,13 @@ impl App {
             return false;
         }
 
+        let inside_tmux = std::env::var_os("TMUX").is_some();
+
         // If the terminal already reports modified Enter, Shift+Enter works and
-        // changing config would be noise.
-        if terminal_setup::supports_modified_enter_reporting() == Some(true) {
+        // changing keyboard config would be noise. Inside tmux we still run
+        // setup: the same config file also enables graphics passthrough, which
+        // tmux masks regardless of whether the keyboard protocol works.
+        if !inside_tmux && terminal_setup::supports_modified_enter_reporting() == Some(true) {
             self.push_display_message(DisplayMessage::system(
                 "✓ Shift+Enter already works: this terminal reports modified Enter \
                  via the kitty keyboard protocol.\n\
@@ -28,7 +32,6 @@ impl App {
             return true;
         }
 
-        let inside_tmux = std::env::var_os("TMUX").is_some();
         let term_program = std::env::var("TERM_PROGRAM").ok();
         let target = terminal_setup::diagnose(term_program.as_deref(), inside_tmux);
 
@@ -45,18 +48,30 @@ impl App {
 
         match terminal_setup::apply(target, &home) {
             Ok(Applied::Changed { detail }) => {
+                let what = match target {
+                    terminal_setup::SetupTarget::Tmux => {
+                        "Shift+Enter and inline images (passthrough)"
+                    }
+                    _ => "Shift+Enter",
+                };
                 self.push_display_message(DisplayMessage::system(format!(
-                    "✓ Configured {} so Shift+Enter is reported distinctly from Enter.\n\
-                     {detail}\n{}",
+                    "✓ Configured {} for {}.\n{detail}\n{}",
                     target.label(),
+                    what,
                     target.activation_note()
                 )));
             }
             Ok(Applied::AlreadyConfigured) => {
+                let what = match target {
+                    terminal_setup::SetupTarget::Tmux => {
+                        "Shift+Enter and inline images (passthrough)"
+                    }
+                    _ => "Shift+Enter",
+                };
                 self.push_display_message(DisplayMessage::system(format!(
-                    "{} is already configured for Shift+Enter.\n\
-                     If the chord still submits, {}",
+                    "{} is already configured for {}.\nIf it still does not work, {}",
                     target.label(),
+                    what,
                     target.activation_note()
                 )));
             }

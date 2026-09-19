@@ -35,6 +35,16 @@ pub enum ImageProtocol {
 impl ImageProtocol {
     /// Detect the best available image protocol for the current terminal
     pub fn detect() -> Self {
+        // Inside tmux, TERM/TERM_PROGRAM describe tmux itself, not the outer
+        // terminal, so env detection cannot see whether Ghostty/kitty is
+        // attached. Ask tmux about its client first; fall back to env detection
+        // when tmux is absent or detached.
+        if in_tmux()
+            && let Some(protocol) = tmux_outer_protocol()
+        {
+            return protocol;
+        }
+
         // Check for Kitty first (most capable)
         if std::env::var("KITTY_WINDOW_ID").is_ok() {
             return Self::Kitty;
@@ -128,6 +138,55 @@ fn escape_tmux(is_tmux: bool) -> (&'static str, &'static str, &'static str) {
 fn in_tmux() -> bool {
     std::env::var("TMUX").is_ok_and(|v| !v.trim().is_empty())
         || std::env::var("TERM").is_ok_and(|t| t.starts_with("tmux"))
+}
+
+/// Ask tmux for a client-side format string, e.g. `#{client_termname}`.
+///
+/// Returns `None` when tmux is unavailable, detached, or the query fails, so
+/// callers can fall back to environment detection.
+fn tmux_client_query(format: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", format])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// Resolve the outer terminal's image protocol by asking tmux about its client.
+///
+/// `client_termname` is the outer terminal's `TERM` (e.g. `xterm-ghostty` for
+/// Ghostty) and `client_termfeatures` lists the capabilities tmux negotiated
+/// with it (e.g. `sixel`). This is the only reliable signal inside a
+/// multiplexer, which otherwise rewrites `TERM`/`TERM_PROGRAM`.
+fn tmux_outer_protocol() -> Option<ImageProtocol> {
+    let termname = tmux_client_query("#{client_termname}")?;
+    let features = tmux_client_query("#{client_termfeatures}").unwrap_or_default();
+    protocol_from_tmux_client(&termname, &features, *HAS_IMAGEMAGICK)
+}
+
+/// Pure mapping from tmux client facts to an image protocol.
+fn protocol_from_tmux_client(
+    termname: &str,
+    features: &str,
+    imagemagick: bool,
+) -> Option<ImageProtocol> {
+    if is_kitty_terminal_name(termname) {
+        return Some(ImageProtocol::Kitty);
+    }
+    if termname.to_ascii_lowercase().contains("iterm") {
+        return Some(iterm2_protocol());
+    }
+    let has_sixel = features
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .any(|feature| feature == "sixel");
+    if has_sixel && imagemagick {
+        return Some(ImageProtocol::Sixel);
+    }
+    None
 }
 
 /// iTerm2's inline-image protocol corrupts jcode's TUI output in real iTerm2,
@@ -356,22 +415,19 @@ fn display_kitty(
         .map(|c| std::str::from_utf8(c).unwrap_or(""))
         .collect();
 
+    let is_tmux = in_tmux();
     for (i, chunk) in chunks.iter().enumerate() {
-        let is_first = i == 0;
         let is_last = i == chunks.len() - 1;
         let more = if is_last { 0 } else { 1 };
 
-        if is_first {
-            // First chunk includes all parameters
-            write!(
-                stdout,
-                "\x1b_Ga=T,f=100,c={},r={},m={};{}\x1b\\",
-                cols, rows, more, chunk
-            )?;
+        // The first chunk carries the display parameters; later chunks only the
+        // `m` continuation flag.
+        let header = if i == 0 {
+            format!("Ga=T,f=100,c={},r={},m={}", cols, rows, more)
         } else {
-            // Subsequent chunks only have m flag
-            write!(stdout, "\x1b_Gm={};{}\x1b\\", more, chunk)?;
-        }
+            format!("Gm={}", more)
+        };
+        write!(stdout, "{}", kitty_chunk_payload(&header, chunk, is_tmux))?;
     }
 
     // Newline after image
@@ -379,6 +435,16 @@ fn display_kitty(
     stdout.flush()?;
 
     Ok(true)
+}
+
+/// Wrap one Kitty graphics APC chunk in tmux passthrough when needed.
+///
+/// tmux strips unknown APC sequences, so the whole `ESC _ G ... ESC \` chunk
+/// must be wrapped in `ESC Ptmux; ... ESC \` with every inner ESC doubled.
+/// Unwrapped, tmux either drops the image or leaks the payload as text.
+fn kitty_chunk_payload(header: &str, chunk: &str, is_tmux: bool) -> String {
+    let (start, escape, end) = escape_tmux(is_tmux);
+    format!("{start}{escape}_{header};{chunk}{escape}\\{end}")
 }
 
 /// Display image using iTerm2 inline image protocol
@@ -539,6 +605,62 @@ mod tests {
         // having no usable image protocol.
         assert_eq!(iterm2_protocol(), ImageProtocol::None);
         assert!(!iterm2_images_enabled());
+    }
+
+    #[test]
+    fn tmux_client_maps_kitty_terminals_to_kitty_protocol() {
+        // tmux's `client_termname` is the outer terminal's TERM, which is the
+        // only way to see Ghostty/kitty from inside a multiplexer.
+        assert_eq!(
+            protocol_from_tmux_client("xterm-ghostty", "", false),
+            Some(ImageProtocol::Kitty)
+        );
+        assert_eq!(
+            protocol_from_tmux_client("xterm-kitty", "", false),
+            Some(ImageProtocol::Kitty)
+        );
+    }
+
+    #[test]
+    fn tmux_client_maps_sixel_only_with_imagemagick() {
+        assert_eq!(
+            protocol_from_tmux_client("xterm-256color", "RGB,sixel,hyperlinks", true),
+            Some(ImageProtocol::Sixel)
+        );
+        // Without ImageMagick there is no way to encode Sixel, so do not claim it.
+        assert_eq!(
+            protocol_from_tmux_client("xterm-256color", "RGB,sixel", false),
+            None
+        );
+        assert_eq!(protocol_from_tmux_client("xterm-256color", "RGB", true), None);
+    }
+
+    #[test]
+    fn tmux_client_unknown_outer_terminal_reports_none() {
+        assert_eq!(protocol_from_tmux_client("dumb", "", true), None);
+    }
+
+    #[test]
+    fn kitty_chunk_payload_is_plain_outside_tmux() {
+        let payload = kitty_chunk_payload("Ga=T,f=100,c=4,r=2,m=0", "QUJD", false);
+        assert_eq!(payload, "\x1b_Ga=T,f=100,c=4,r=2,m=0;QUJD\x1b\\");
+    }
+
+    #[test]
+    fn kitty_chunk_payload_uses_tmux_passthrough_inside_tmux() {
+        let payload = kitty_chunk_payload("Ga=T,f=100,c=4,r=2,m=0", "QUJD", true);
+        // tmux requires the DCS wrapper with every inner ESC doubled, otherwise
+        // it drops the image or leaks the base64 as text.
+        assert_eq!(
+            payload,
+            "\x1bPtmux;\x1b\x1b_Ga=T,f=100,c=4,r=2,m=0;QUJD\x1b\x1b\\\x1b\\"
+        );
+    }
+
+    #[test]
+    fn kitty_continuation_chunk_only_carries_the_more_flag() {
+        let payload = kitty_chunk_payload("Gm=1", "QUJD", false);
+        assert_eq!(payload, "\x1b_Gm=1;QUJD\x1b\\");
     }
 
     #[test]
