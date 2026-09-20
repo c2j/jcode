@@ -494,10 +494,13 @@ jobs:
       # release.yml owns the release notes and the .tar.gz assets. Upload the
       # zips alongside them, creating the release as a draft only if this
       # workflow raced ahead of release.yml's create-release job.
+      # This job deliberately has no checkout, so `gh` has no git remote to
+      # infer the repository from: GH_REPO supplies it explicitly.
       - name: Upload zips to the tag release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="$JCODE_ZIP_TAG"
