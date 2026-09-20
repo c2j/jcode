@@ -13,6 +13,14 @@
 #
 # Notes on the two compatibility requirements:
 #
+# The zips are attached to the release that release.yml creates for the same
+# tag. That release stays a *draft* - and a draft has no tag page, so the assets
+# are not downloadable - until release.yml's finalize job sees every platform
+# asset validated. Where that can never happen (a fork without the deploy /
+# signing / package-manager secrets), publish from this workflow instead: set
+# the repository variable `JCODE_ZIP_PUBLISH=true`, or dispatch it with
+# `publish: true`. Both are opt-in; the default keeps release.yml in charge.
+#
 # * Low glibc: `cargo zigbuild --target <triple>.2.17` links against Zig's
 #   bundled glibc 2.17 stubs, so the binary keeps running on old distros while
 #   still working on modern ones. The CI gate re-reads the produced ELF and
@@ -59,6 +67,11 @@ on:
         description: Existing version tag to build (e.g. v0.85.0)
         required: true
         type: string
+      publish:
+        description: Publish the release after attaching the zips
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: jcode-release-zips-${{ inputs.tag || github.ref }}
@@ -509,3 +522,26 @@ jobs:
           fi
           gh release upload "$tag" dist/*.zip dist/SHA256SUMS-zips.txt --clobber
           gh release view "$tag" --json assets --jq '.assets[].name' | sort
+
+      # A draft release has no tag page, so nobody can download the zips until
+      # it is published. release.yml publishes once every platform asset has
+      # been validated; where that cannot happen (a fork without its signing /
+      # deploy secrets), opt into publishing from this workflow instead:
+      #   * workflow_dispatch with publish=true, or
+      #   * repository variable JCODE_ZIP_PUBLISH=true, which applies to the
+      #     tag pushes as well (delete the variable to go back to drafts).
+      - name: Publish the release
+        if: ${{ inputs.publish || vars.JCODE_ZIP_PUBLISH == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$JCODE_ZIP_TAG"
+          if [[ "$(gh release view "$tag" --json isDraft --jq '.isDraft')" == "true" ]]; then
+            gh release edit "$tag" --draft=false
+            echo "published $tag"
+          else
+            echo "$tag is already published"
+          fi
