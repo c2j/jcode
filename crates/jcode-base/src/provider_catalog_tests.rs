@@ -417,7 +417,18 @@ fn auth_issue_runtime_display_name_tracks_direct_compatible_profiles() {
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_NAMED_PROVIDER_PROFILE",
         "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
     ]);
+    // A provider selection inherited from the shell that launched `cargo test`
+    // (e.g. running inside an active jcode session) would take precedence over
+    // the profiles applied below, so start from a clean selection.
+    for var in [
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+    ] {
+        crate::env::remove_var(var);
+    }
 
     crate::env::set_var("JCODE_RUNTIME_PROVIDER", "azure-openai");
     assert_eq!(runtime_provider_display_name("openrouter"), "Azure OpenAI");
