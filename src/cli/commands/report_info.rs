@@ -576,6 +576,7 @@ pub(super) fn list_cli_providers() -> Vec<ProviderListEntry> {
         ProviderChoice::TogetherAi,
         ProviderChoice::Deepinfra,
         ProviderChoice::Novita,
+        ProviderChoice::OrcaRouter,
         ProviderChoice::Xai,
         ProviderChoice::GrokBuild,
         ProviderChoice::Chutes,

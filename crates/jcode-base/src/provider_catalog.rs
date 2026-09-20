@@ -71,7 +71,7 @@ pub fn resolve_openai_compatible_profile_with_api_key_hint(
             resolved.api_base = normalized;
         } else {
             eprintln!(
-                "Warning: ignoring invalid JCODE_OPENAI_COMPAT_API_BASE '{}'. Use https://... (or http://localhost).",
+                "Warning: ignoring invalid JCODE_OPENAI_COMPAT_API_BASE '{}'. Use https://... (or http://localhost, or list the host in JCODE_ALLOW_INSECURE_HTTP_HOSTS).",
                 base
             );
         }
@@ -855,7 +855,7 @@ pub fn apply_named_provider_profile_env_from_config(
 
     let api_base = normalize_api_base(&profile.base_url).ok_or_else(|| {
         anyhow::anyhow!(
-            "Provider profile '{}' has invalid base_url '{}'. Use https://... or http://localhost.",
+            "Provider profile '{}' has invalid base_url '{}'. Use https://... or http://localhost, or list the host in JCODE_ALLOW_INSECURE_HTTP_HOSTS.",
             profile_name,
             profile.base_url
         )
@@ -1251,6 +1251,15 @@ pub fn configured_api_key_source(
     }
 
     Some((env_key, file_name))
+}
+
+/// Let settings resolved inside the `jcode-provider-metadata` leaf crate (such
+/// as `JCODE_ALLOW_INSECURE_HTTP_HOSTS`) also be read from the provider env
+/// file, matching how the rest of the OpenAI-compatible config is loaded.
+pub fn install_provider_env_file_value_resolver() {
+    register_env_file_value_resolver(|name| {
+        load_env_value_from_env_or_config(name, OPENAI_COMPAT_PROFILE.env_file)
+    });
 }
 
 fn env_override(name: &str) -> Option<String> {

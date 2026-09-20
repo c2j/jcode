@@ -14,10 +14,22 @@ static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     let mutex = ENV_LOCK.get_or_init(|| Mutex::new(()));
-    match mutex.lock() {
+    let guard = match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    };
+    // Tests run with a sandboxed JCODE_HOME, but an inherited provider
+    // selection (e.g. `cargo test` launched from a shell inside an active jcode
+    // session) would still resolve a profile that the sandboxed config does not
+    // define. Clear it so each test starts from a clean provider selection.
+    for var in [
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+    ] {
+        crate::env::remove_var(var);
     }
+    guard
 }
 
 #[test]
@@ -304,7 +316,7 @@ fn test_init_provider_jcode_delegates_runtime_profile_to_wrapper() {
         .block_on(init_provider(&ProviderChoice::Jcode, None))
         .expect("init jcode provider");
 
-    assert_eq!(provider.name(), "Jcode Hosted Models");
+    assert_eq!(provider.name(), "Jcode Subscription");
     assert!(crate::subscription_catalog::is_runtime_mode_enabled());
     assert_eq!(
         std::env::var("JCODE_OPENROUTER_MODEL").ok().as_deref(),

@@ -245,6 +245,55 @@ pub fn is_safe_env_file_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
+/// Comma-separated opt-in allowlist that lets plain `http://` be used with
+/// hosts jcode rejects by default (public hostnames and public IPs).
+///
+/// Entries are matched case-insensitively against the URL host:
+///   * `example.com`      exact host
+///   * `*.example.com`    any subdomain (a leading `.` also works)
+///   * `example.com:8000` exact host, port must match too
+///   * `*`                allow every `http://` host
+///
+/// Default behavior is unchanged when the variable is unset or empty.
+pub const ALLOW_INSECURE_HTTP_HOSTS_ENV: &str = "JCODE_ALLOW_INSECURE_HTTP_HOSTS";
+
+/// Resolvers that read a `JCODE_*` setting from jcode's config env files.
+///
+/// This leaf crate cannot see the config directory, so a higher-level crate
+/// registers one at startup. That keeps settings resolved here (such as the
+/// plain-HTTP host allowlist) consistent with the rest of the provider config,
+/// which is also settable from the provider env file.
+type EnvFileValueResolver = fn(&str) -> Option<String>;
+
+static ENV_FILE_VALUE_RESOLVERS: std::sync::LazyLock<std::sync::RwLock<Vec<EnvFileValueResolver>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+
+/// Register a fallback that reads a setting from jcode's config env files.
+pub fn register_env_file_value_resolver(resolver: EnvFileValueResolver) {
+    ENV_FILE_VALUE_RESOLVERS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(resolver);
+}
+
+fn resolve_env_file_value(name: &str) -> Option<String> {
+    let resolvers = ENV_FILE_VALUE_RESOLVERS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    resolvers.iter().find_map(|resolver| resolver(name))
+}
+
+/// Process environment first, then registered config env files.
+fn env_or_config_value(name: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(name) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    resolve_env_file_value(name).filter(|value| !value.trim().is_empty())
+}
+
 pub fn normalize_api_base(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -259,7 +308,8 @@ pub fn normalize_api_base(raw: &str) -> Option<String> {
 
     if scheme == "http" {
         let host = parsed.host_str()?;
-        if !allows_insecure_http_host(host) {
+        let port = parsed.port_or_known_default();
+        if !allows_insecure_http_host(host, port) {
             return None;
         }
     }
@@ -267,7 +317,18 @@ pub fn normalize_api_base(raw: &str) -> Option<String> {
     Some(trimmed.trim_end_matches('/').to_string())
 }
 
-fn allows_insecure_http_host(host: &str) -> bool {
+/// Whether a plain `http://` host is allowed, honoring
+/// [`ALLOW_INSECURE_HTTP_HOSTS_ENV`].
+pub fn allows_insecure_http_host(host: &str, port: Option<u16>) -> bool {
+    let extra = env_or_config_value(ALLOW_INSECURE_HTTP_HOSTS_ENV).unwrap_or_default();
+    allows_insecure_http_host_with(host, port, &extra)
+}
+
+pub fn allows_insecure_http_host_with(host: &str, port: Option<u16>, extra_hosts: &str) -> bool {
+    if matches_allowlist(host, port, extra_hosts) {
+        return true;
+    }
+
     let host = host.trim();
     let host = host
         .strip_prefix('[')
@@ -301,6 +362,54 @@ fn allows_insecure_http_host(host: &str) -> bool {
     false
 }
 
+fn matches_allowlist(host: &str, port: Option<u16>, extra_hosts: &str) -> bool {
+    let host = strip_brackets(host.trim()).to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+
+    extra_hosts.split(',').any(|entry| {
+        let entry = entry.trim().to_ascii_lowercase();
+        if entry.is_empty() {
+            return false;
+        }
+        if entry == "*" {
+            return true;
+        }
+
+        let (entry_host, entry_port) = match entry.rsplit_once(':') {
+            // Keep IPv6 literals like `[fd00::1]` intact.
+            Some((head, tail)) if !tail.is_empty() => match tail.parse::<u16>() {
+                Ok(parsed_port) => (head.to_string(), Some(parsed_port)),
+                Err(_) => (entry.clone(), None),
+            },
+            _ => (entry.clone(), None),
+        };
+        if entry_port.is_some() && entry_port != port {
+            return false;
+        }
+
+        let entry_host = strip_brackets(&entry_host);
+        if entry_host == "*" {
+            return true;
+        }
+        if let Some(suffix) = entry_host.strip_prefix("*.").or_else(|| {
+            entry_host
+                .starts_with('.')
+                .then(|| entry_host.trim_start_matches('.'))
+        }) {
+            return !suffix.is_empty() && host.ends_with(&format!(".{suffix}"));
+        }
+        entry_host == host
+    })
+}
+
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 fn normalize_provider_input(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -313,6 +422,30 @@ fn normalize_provider_input(input: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Serializes tests that mutate process-wide environment variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        &ENV_LOCK
+    }
+
+    mod test_env {
+        pub fn var(name: &str) -> Option<String> {
+            std::env::var(name).ok()
+        }
+
+        pub fn set_var(name: &str, value: &str) {
+            // SAFETY: callers hold ENV_LOCK, so no other test thread reads or
+            // writes the environment concurrently.
+            unsafe { std::env::set_var(name, value) }
+        }
+
+        pub fn remove_var(name: &str) {
+            // SAFETY: see `set_var`.
+            unsafe { std::env::remove_var(name) }
+        }
+    }
 
     #[test]
     fn matrix_profiles_have_unique_ids_and_safe_metadata() {
@@ -385,8 +518,140 @@ mod tests {
 
     #[test]
     fn normalize_api_base_rejects_public_http_hosts() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        test_env::remove_var(ALLOW_INSECURE_HTTP_HOSTS_ENV);
         assert_eq!(normalize_api_base("http://example.com/v1"), None);
         assert_eq!(normalize_api_base("http://8.8.8.8/v1"), None);
+    }
+
+    #[test]
+    fn insecure_http_allowlist_matches_exact_hosts() {
+        assert!(allows_insecure_http_host_with(
+            "llm.example.com",
+            Some(8000),
+            "llm.example.com"
+        ));
+        assert!(allows_insecure_http_host_with(
+            "LLM.Example.com",
+            Some(8000),
+            " llm.example.com , other.host "
+        ));
+        assert!(!allows_insecure_http_host_with(
+            "evil.example.com",
+            Some(8000),
+            "llm.example.com"
+        ));
+        // A suffix entry must not match the bare domain it is a suffix of.
+        assert!(!allows_insecure_http_host_with(
+            "example.com",
+            Some(8000),
+            "*.example.com"
+        ));
+    }
+
+    #[test]
+    fn insecure_http_allowlist_matches_wildcards_and_ports() {
+        assert!(allows_insecure_http_host_with(
+            "a.example.com",
+            Some(80),
+            "*.example.com"
+        ));
+        assert!(allows_insecure_http_host_with(
+            "a.example.com",
+            Some(80),
+            ".example.com"
+        ));
+        assert!(!allows_insecure_http_host_with(
+            "a.example.org",
+            Some(80),
+            "*.example.com"
+        ));
+        assert!(allows_insecure_http_host_with("8.8.8.8", Some(8080), "*"));
+        assert!(allows_insecure_http_host_with(
+            "gateway.example.com",
+            Some(8080),
+            "gateway.example.com:8080"
+        ));
+        assert!(!allows_insecure_http_host_with(
+            "gateway.example.com",
+            Some(9090),
+            "gateway.example.com:8080"
+        ));
+        assert!(allows_insecure_http_host_with(
+            "gateway.example.com",
+            Some(8080),
+            "*:8080"
+        ));
+        assert!(!allows_insecure_http_host_with(
+            "gateway.example.com",
+            Some(80),
+            "*:8080"
+        ));
+        // Public IPv6 literals need the allowlist, and the port must match.
+        assert!(allows_insecure_http_host_with(
+            "[2001:db8::1]",
+            Some(8080),
+            "[2001:db8::1]"
+        ));
+        assert!(allows_insecure_http_host_with(
+            "[2001:db8::1]",
+            Some(8080),
+            "[2001:db8::1]:8080"
+        ));
+        assert!(!allows_insecure_http_host_with(
+            "[2001:db8::1]",
+            Some(9090),
+            "[2001:db8::1]:8080"
+        ));
+        assert!(!allows_insecure_http_host_with("", Some(80), "*"));
+    }
+
+    #[test]
+    fn insecure_http_allowlist_env_var_enables_public_http() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let original = test_env::var(ALLOW_INSECURE_HTTP_HOSTS_ENV);
+        test_env::set_var(
+            ALLOW_INSECURE_HTTP_HOSTS_ENV,
+            " api.example.com , 8.8.4.4:8080 ",
+        );
+
+        assert_eq!(
+            normalize_api_base("http://api.example.com/v1/").as_deref(),
+            Some("http://api.example.com/v1")
+        );
+        assert_eq!(
+            normalize_api_base("http://8.8.4.4:8080/v1").as_deref(),
+            Some("http://8.8.4.4:8080/v1")
+        );
+        // Ports not in the allowlist stay rejected.
+        assert_eq!(normalize_api_base("http://8.8.4.4/v1"), None);
+        // Unlisted hosts stay rejected.
+        assert_eq!(normalize_api_base("http://other.example.com/v1"), None);
+        // Private hosts keep working without the allowlist.
+        assert_eq!(
+            normalize_api_base("http://192.168.1.25:8000/v1").as_deref(),
+            Some("http://192.168.1.25:8000/v1")
+        );
+
+        match original {
+            Some(value) => test_env::set_var(ALLOW_INSECURE_HTTP_HOSTS_ENV, &value),
+            None => test_env::remove_var(ALLOW_INSECURE_HTTP_HOSTS_ENV),
+        }
+    }
+
+    #[test]
+    fn insecure_http_allowlist_reads_registered_env_file_resolver() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        test_env::remove_var(ALLOW_INSECURE_HTTP_HOSTS_ENV);
+        register_env_file_value_resolver(|name| {
+            (name == ALLOW_INSECURE_HTTP_HOSTS_ENV).then(|| "envfile.example.net".to_string())
+        });
+
+        assert_eq!(
+            normalize_api_base("http://envfile.example.net/v1").as_deref(),
+            Some("http://envfile.example.net/v1")
+        );
+        assert_eq!(normalize_api_base("http://other.example.net/v1"), None);
     }
 
     #[test]
