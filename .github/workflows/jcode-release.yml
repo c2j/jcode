@@ -1,0 +1,434 @@
+# Portable zip release pipeline.
+#
+# Additive sibling of `.github/workflows/release.yml` (which is intentionally
+# left untouched). Triggered by the same version-tag creation event, but instead
+# of the MSVC/glibc-2.17-container matrix used there, it cross-compiles from
+# Linux with Zig (`cargo-zigbuild`, the approach used by c2j/grok-build) and
+# ships every platform as a `.zip`:
+#
+#   jcode-<version>-linux-x86_64.zip    glibc >= 2.17 (CentOS 7 / Ubuntu 14.04+)
+#   jcode-<version>-linux-aarch64.zip   glibc >= 2.17
+#   jcode-<version>-windows-x86_64.zip  Windows 10+ today, built with the
+#                                       Windows 7 target (see below)
+#
+# Notes on the two compatibility requirements:
+#
+# * Low glibc: `cargo zigbuild --target <triple>.2.17` links against Zig's
+#   bundled glibc 2.17 stubs, so the binary keeps running on old distros while
+#   still working on modern ones. The CI gate re-reads the produced ELF and
+#   fails if any `GLIBC_x.y` symbol version above the target baseline appears.
+#
+# * Windows: this job cross-builds the tier-3 `x86_64-win7-windows-gnu` target
+#   (`target_vendor = "win7"`) instead of `x86_64-pc-windows-gnu`, because every
+#   tier-1 Windows target statically imports `ProcessPrng` from
+#   `bcryptprimitives.dll`, which does not exist before Windows 8: such a binary
+#   cannot even be loaded on Windows 7. The win7 target makes std fall back to
+#   `RtlGenRandom` (advapi32) and keeps the PE subsystem version at 6.0, which
+#   removes that blocker. Tier-3 targets ship no prebuilt std, hence nightly +
+#   `-Z build-std`.
+#
+#   Necessary, but not yet sufficient, for Windows 7: third-party crates still
+#   import Windows 8+/10+ API sets that do not exist on Windows 7, and a static
+#   import of a missing API-set DLL fails at load time:
+#     - `arboard` -> PathCchStripPrefix (api-ms-win-core-path-l1-1-0, Win8+)
+#     - `terminal-trx` -> CompareObjectHandles (api-ms-win-core-handle-l1-1-0,
+#       Win10+)
+#     - `windows-result` -> RoOriginateErrorW (WinRT error API set)
+#   So today the zip targets Windows 10+, the same floor as the official MSVC
+#   artifacts. The compatibility step fails the build if the std-level
+#   `bcryptprimitives.dll` import ever returns, and otherwise prints the
+#   remaining API-set imports as a CI warning so the gap stays visible. Once
+#   those crates stop importing them, this job produces a Windows 7 loadable
+#   binary with no workflow change. (Windows 7 SP1 additionally needs the
+#   Universal C Runtime, KB2999226, for the api-ms-win-crt-* imports, which
+#   every MSVC-built program - including Rust's own `*-win7-windows-msvc`
+#   target - requires.)
+name: Release Zips
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (e.g. v0.85.0)
+        required: true
+        type: string
+
+concurrency:
+  group: jcode-release-zips-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  JCODE_RELEASE_BUILD: "1"
+  JCODE_CI_BUILD: "1"
+  # Same profile the official pipeline builds (`cargo build --release`), so the
+  # zips match the .tar.gz assets in optimization level and stay cheap to link
+  # on a 4-core runner. Set to `release-lto` (what scripts/install_release.sh
+  # uses locally) for a slightly better-optimized, slower-to-build binary.
+  JCODE_ZIP_PROFILE: release
+  JCODE_ZIP_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    # Each target is independent: a failed Windows cross-build must not hide a
+    # successful Linux zip (same policy as release.yml).
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu.2.17
+            triple: x86_64-unknown-linux-gnu
+            binary: jcode
+            glibc: "2.17"
+            elf_machine: 62
+            nightly: false
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu.2.17
+            triple: aarch64-unknown-linux-gnu
+            binary: jcode
+            glibc: "2.17"
+            elf_machine: 183
+            nightly: false
+          - platform: windows-x86_64
+            target: x86_64-win7-windows-gnu
+            triple: x86_64-win7-windows-gnu
+            binary: jcode.exe
+            glibc: ""
+            pe_machine: 0x8664
+            max_subsystem_version: "6.1"
+            nightly: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install Rust (stable)
+        if: matrix.nightly != true
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      # Tier-3 win7 target: no prebuilt std, so build-std needs nightly +
+      # rust-src.
+      - name: Install Rust (nightly + rust-src for -Z build-std)
+        if: matrix.nightly == true
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # Zig is the cross C compiler/linker behind cargo-zigbuild, and its
+      # bundled glibc stubs are what pin the Linux targets to 2.17.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.2"
+
+      - name: Install cargo-zigbuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Plain binary, so build it with stable when the runner has it; the
+          # Windows job's nightly is only needed for `-Z build-std`.
+          if rustup toolchain list | grep -q '^stable'; then
+            cargo +stable install --locked cargo-zigbuild
+          else
+            cargo install --locked cargo-zigbuild
+          fi
+          cargo zigbuild --help >/dev/null
+
+      # aws-lc-sys (rustls' crypto backend) assembles x86_64 Windows code with
+      # NASM. cmake is already on the runner image.
+      - name: Install NASM (aws-lc-sys Windows assembly)
+        if: matrix.nightly == true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nasm
+          nasm -v
+
+      # rustc emits `-Wl,--fix-cortex-a53-843419` as a hardcoded pre-link arg
+      # for aarch64-linux-gnu, and Zig's bundled lld rejects it outright
+      # ("unsupported linker arg"), so filter it in a thin `zig cc` wrapper.
+      # cargo-zigbuild honours an explicit CARGO_TARGET_*_LINKER.
+      - name: Configure aarch64 linker wrapper
+        if: matrix.triple == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wrapper="$RUNNER_TEMP/zigcc-aarch64-filter.sh"
+          cat > "$wrapper" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          out=()
+          for arg in "$@"; do
+            case "$arg" in
+              -Wl,--fix-cortex-a53-843419|-Wl,--fix-cortex-a53-843419=*) continue ;;
+            esac
+            out+=("$arg")
+          done
+          exec zig cc -target aarch64-linux-gnu.2.17 "${out[@]}"
+          SH
+          chmod +x "$wrapper"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$wrapper" >> "$GITHUB_ENV"
+
+      # `windows-targets 0.48.5` links its import lib as `windows.0.48.5`, but
+      # the owning crate's build script emits its search path only when TARGET
+      # is exactly `x86_64-pc-windows-gnu` (or the uwp triple), so on the win7
+      # triple the final link dies with:
+      #   unable to find dynamic system library 'windows.0.48.5'
+      # Fetch the registry and add every windows_x86_64_gnu import-lib dir
+      # ourselves; older versions (which need this) are then covered too.
+      - name: Add Windows import-lib search paths
+        if: matrix.nightly == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +nightly fetch --locked --target "${{ matrix.target }}"
+          flags=()
+          while IFS= read -r dir; do
+            flags+=("-L" "native=$dir/lib")
+          done < <(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -maxdepth 2 \
+                     -type d -name 'windows_x86_64_gnu-*' \
+                     -exec test -d '{}/lib' ';' -print | sort)
+          if [[ "${#flags[@]}" -eq 0 ]]; then
+            echo "no windows_x86_64_gnu import libs found in the registry" >&2
+            exit 1
+          fi
+          printf 'import-lib search paths: %s\n' "${flags[*]}"
+          echo "CARGO_TARGET_X86_64_WIN7_WINDOWS_GNU_RUSTFLAGS=${flags[*]}" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        env:
+          JCODE_BUILD_SEMVER: ${{ env.JCODE_ZIP_TAG }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.nightly }}" == "true" ]]; then
+            cargo +nightly zigbuild --locked --profile "$JCODE_ZIP_PROFILE" \
+              -Z build-std=std,panic_abort \
+              --target "${{ matrix.target }}" \
+              -p jcode --bin jcode
+          else
+            cargo zigbuild --locked --profile "$JCODE_ZIP_PROFILE" \
+              --target "${{ matrix.target }}" \
+              -p jcode --bin jcode
+          fi
+
+      - name: Verify compatibility (glibc baseline / Windows 7)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${{ matrix.triple }}" "$JCODE_ZIP_PROFILE" "${{ matrix.binary }}" \
+            "${{ matrix.glibc }}" "${{ matrix.elf_machine }}" \
+            "${{ matrix.pe_machine }}" "${{ matrix.max_subsystem_version }}" <<'PY'
+          import os, re, struct, sys
+
+          triple, profile, binary, glibc_min, elf_machine, pe_machine, max_subsys = sys.argv[1:8]
+          path = f"target/{triple}/{profile}/{binary}"
+          if not os.path.exists(path):
+              print(f"FAIL {path}: built binary not found", file=sys.stderr)
+              sys.exit(1)
+          data = open(path, "rb").read()
+
+          def fail(msg):
+              print(f"FAIL {path}: {msg}", file=sys.stderr)
+              sys.exit(1)
+
+          def elf_glibc_versions(data):
+              # Walk SHT_GNU_verneed so the check needs no binutils.
+              shoff = struct.unpack_from("<Q", data, 0x28)[0]
+              shentsize = struct.unpack_from("<H", data, 0x3A)[0]
+              shnum = struct.unpack_from("<H", data, 0x3C)[0]
+              shs = []
+              for i in range(shnum):
+                  off = shoff + i * shentsize
+                  _, sh_type, _, _, sh_offset, sh_size, sh_link, _, _, _ = \
+                      struct.unpack_from("<IIQQQQIIQQ", data, off)
+                  shs.append((sh_type, sh_offset, sh_size, sh_link))
+              versions = set()
+              for sh_type, sh_offset, sh_size, sh_link in shs:
+                  if sh_type != 0x6FFFFFFE:
+                      continue
+                  _, str_off, str_size, _ = shs[sh_link]
+                  strtab = data[str_off:str_off + str_size]
+                  off, end = sh_offset, sh_offset + sh_size
+                  while off < end:
+                      _, vn_cnt, _, vn_aux, vn_next = struct.unpack_from("<HHIII", data, off)
+                      aux = off + vn_aux
+                      for _ in range(vn_cnt):
+                          _, _, _, vna_name, vna_next = struct.unpack_from("<IHHII", data, aux)
+                          versions.add(strtab[vna_name:strtab.index(b"\0", vna_name)].decode())
+                          if vna_next == 0:
+                              break
+                          aux += vna_next
+                      if vn_next == 0:
+                          break
+                      off += vn_next
+              return {tuple(map(int, m.group(1).split("."))) for v in versions
+                      for m in [re.fullmatch(r"GLIBC_(\d+\.\d+(?:\.\d+)?)", v)] if m}
+
+          if data[:4] == b"\x7fELF":
+              if data[4] != 2:
+                  fail("not a 64-bit ELF")
+              machine = int.from_bytes(data[18:20], "little")
+              if elf_machine and machine != int(elf_machine):
+                  fail(f"ELF machine {machine} != {elf_machine}")
+              found = elf_glibc_versions(data)
+              newest = ".".join(map(str, max(found))) if found else "(none)"
+              if glibc_min and found and max(found) > tuple(map(int, glibc_min.split("."))):
+                  fail(f"requires GLIBC_{newest}, baseline is {glibc_min}")
+              print(f"OK {path}: ELF64 machine={machine} max GLIBC_{newest} <= {glibc_min}")
+          elif data[:2] == b"MZ":
+              pe = struct.unpack_from("<I", data, 0x3C)[0]
+              if data[pe:pe + 4] != b"PE\0\0":
+                  fail("bad PE signature")
+              coff = pe + 4
+              machine = struct.unpack_from("<H", data, coff)[0]
+              if pe_machine and machine != int(pe_machine, 0):
+                  fail(f"PE machine {machine:#x} != {pe_machine}")
+              opt = coff + 20
+              nsec = struct.unpack_from("<H", data, coff + 2)[0]
+              opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+              subsys = struct.unpack_from("<H", data, opt + 68)[0]
+              subsys_ver = struct.unpack_from("<HH", data, opt + 48)
+              if subsys != 3:
+                  fail(f"expected console subsystem (3), got {subsys}")
+              if max_subsys:
+                  limit = tuple(map(int, max_subsys.split(".")))
+                  if subsys_ver > limit:
+                      fail(f"subsystem version {subsys_ver[0]}.{subsys_ver[1]} > {max_subsys}")
+              sections = []
+              for i in range(nsec):
+                  off = opt + opt_size + i * 40
+                  _, vaddr, rawsize, rawptr = struct.unpack_from("<IIII", data, off + 8)
+                  sections.append((vaddr, rawsize, rawptr))
+
+              def rva2off(rva):
+                  for vaddr, rawsize, rawptr in sections:
+                      if vaddr <= rva < vaddr + rawsize:
+                          return rawptr + (rva - vaddr)
+                  return None
+
+              dd = opt + (112 if struct.unpack_from("<H", data, opt)[0] == 0x20B else 96)
+              off = rva2off(struct.unpack_from("<I", data, dd + 8)[0])
+              imports = []
+              while True:
+                  name_rva = struct.unpack_from("<I", data, off + 12)[0]
+                  if name_rva == 0:
+                      break
+                  name_off = rva2off(name_rva)
+                  imports.append(data[name_off:data.index(b"\0", name_off)].decode().lower())
+                  off += 20
+              # ProcessPrng/bcryptprimitives only exists on Windows 8+; a static
+              # import makes the loader reject the exe on Windows 7. That is the
+              # std-level blocker the win7 target exists to remove, so a
+              # regression here is fatal.
+              if any("bcryptprimitives" in name for name in imports):
+                  fail("imports bcryptprimitives.dll (Windows 8+ only)")
+              # Any other non-CRT API set is a Windows 8+/10+ import that does
+              # not exist on Windows 7 (UCRT, api-ms-win-crt-*, is covered by
+              # KB2999226 and is expected). These come from third-party crates,
+              # not from std, so report them instead of failing the build; see
+              # the Windows note at the top of this workflow.
+              win8_plus = sorted(name for name in imports
+                                 if name.startswith("api-ms-win-")
+                                 and not name.startswith("api-ms-win-crt-"))
+              if win8_plus:
+                  message = (f"{path} imports Windows 8+/10+ API sets "
+                             f"({', '.join(win8_plus)}); the zip targets "
+                             f"Windows 10+ until those crates stop importing them")
+                  print(f"::warning title=Windows 7 not reachable yet::{message}")
+                  print(f"note {message}")
+              print(f"OK {path}: PE machine={machine:#x} subsystem_version="
+                    f"{subsys_ver[0]}.{subsys_ver[1]} imports={len(imports)}")
+          else:
+              fail("unrecognised binary format")
+          PY
+
+      # Real runtime check where the runner can execute the artifact natively.
+      - name: Smoke test (linux x86_64)
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.triple }}/$JCODE_ZIP_PROFILE/${{ matrix.binary }}"
+          "$bin" --version
+
+      - name: Package zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${JCODE_ZIP_TAG#v}"
+          bin="target/${{ matrix.triple }}/$JCODE_ZIP_PROFILE/${{ matrix.binary }}"
+          test -f "$bin"
+          mkdir -p dist
+          cp "$bin" "dist/${{ matrix.binary }}"
+          chmod +x "dist/${{ matrix.binary }}"
+          # -j keeps the archive flat (binary at the root, no parent directory).
+          (cd dist && rm -f "jcode-${version}-${{ matrix.platform }}.zip" \
+            && zip -j -X "jcode-${version}-${{ matrix.platform }}.zip" "${{ matrix.binary }}")
+          unzip -l "dist/jcode-${version}-${{ matrix.platform }}.zip"
+          sha256sum "dist/jcode-${version}-${{ matrix.platform }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jcode-zip-${{ matrix.platform }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Attach zips to release
+    needs: build
+    # Publish whichever targets succeeded; only a total wipeout is an error.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and asset summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [[ "${#zips[@]}" -eq 0 ]]; then
+            echo "No zip artifacts were produced; nothing to publish" >&2
+            exit 1
+          fi
+          cd dist
+          sha256sum ./*.zip > SHA256SUMS-zips.txt
+          cat SHA256SUMS-zips.txt
+
+      # release.yml owns the release notes and the .tar.gz assets. Upload the
+      # zips alongside them, creating the release as a draft only if this
+      # workflow raced ahead of release.yml's create-release job.
+      - name: Upload zips to the tag release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$JCODE_ZIP_TAG"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --draft --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" dist/*.zip dist/SHA256SUMS-zips.txt --clobber
+          gh release view "$tag" --json assets --jq '.assets[].name' | sort
