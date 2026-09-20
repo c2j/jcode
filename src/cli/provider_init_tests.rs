@@ -14,10 +14,22 @@ static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     let mutex = ENV_LOCK.get_or_init(|| Mutex::new(()));
-    match mutex.lock() {
+    let guard = match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    };
+    // Tests run with a sandboxed JCODE_HOME, but an inherited provider
+    // selection (e.g. `cargo test` launched from a shell inside an active jcode
+    // session) would still resolve a profile that the sandboxed config does not
+    // define. Clear it so each test starts from a clean provider selection.
+    for var in [
+        "JCODE_NAMED_PROVIDER_PROFILE",
+        "JCODE_PROVIDER_PROFILE_ACTIVE",
+        "JCODE_PROVIDER_PROFILE_NAME",
+    ] {
+        crate::env::remove_var(var);
     }
+    guard
 }
 
 #[test]
