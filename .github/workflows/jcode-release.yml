@@ -17,6 +17,10 @@
 #   bundled glibc 2.17 stubs, so the binary keeps running on old distros while
 #   still working on modern ones. The CI gate re-reads the produced ELF and
 #   fails if any `GLIBC_x.y` symbol version above the target baseline appears.
+#   The Linux jobs also enable `linux-compat-vendored-openssl` (the feature the
+#   official container build uses): `imap` -> `native-tls` would otherwise pull
+#   in a *dynamic* system OpenSSL, which a cross build cannot satisfy and which
+#   would add a libssl.so runtime dependency to a portable binary.
 #
 # * Windows: this job cross-builds the tier-3 `x86_64-win7-windows-gnu` target
 #   (`target_vendor = "win7"`) instead of `x86_64-pc-windows-gnu`, because every
@@ -90,25 +94,34 @@ jobs:
           - platform: linux-x86_64
             target: x86_64-unknown-linux-gnu.2.17
             triple: x86_64-unknown-linux-gnu
+            env_triple: X86_64_UNKNOWN_LINUX_GNU
+            zig_target: x86_64-linux-gnu.2.17
             binary: jcode
             glibc: "2.17"
             elf_machine: 62
             nightly: false
+            features: linux-compat-vendored-openssl
           - platform: linux-aarch64
             target: aarch64-unknown-linux-gnu.2.17
             triple: aarch64-unknown-linux-gnu
+            env_triple: AARCH64_UNKNOWN_LINUX_GNU
+            zig_target: aarch64-linux-gnu.2.17
             binary: jcode
             glibc: "2.17"
             elf_machine: 183
             nightly: false
+            features: linux-compat-vendored-openssl
           - platform: windows-x86_64
             target: x86_64-win7-windows-gnu
             triple: x86_64-win7-windows-gnu
+            env_triple: ""
+            zig_target: ""
             binary: jcode.exe
             glibc: ""
             pe_machine: 0x8664
             max_subsystem_version: "6.1"
             nightly: true
+            features: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -159,30 +172,86 @@ jobs:
           sudo apt-get install -y -qq nasm
           nasm -v
 
-      # rustc emits `-Wl,--fix-cortex-a53-843419` as a hardcoded pre-link arg
-      # for aarch64-linux-gnu, and Zig's bundled lld rejects it outright
-      # ("unsupported linker arg"), so filter it in a thin `zig cc` wrapper.
-      # cargo-zigbuild honours an explicit CARGO_TARGET_*_LINKER.
-      - name: Configure aarch64 linker wrapper
-        if: matrix.triple == 'aarch64-unknown-linux-gnu'
+      # Vendored OpenSSL (`linux-compat-vendored-openssl`) is built from source
+      # by openssl-src, which needs perl and make. Both ship on the runner
+      # image; fail fast with a clear message if that ever stops being true.
+      - name: Check vendored OpenSSL prerequisites
+        if: matrix.nightly != true
+        run: |
+          perl -v | head -2
+          make --version | head -1
+
+      # A thin `zig cc` wrapper is used as the linker, C compiler and C++
+      # compiler for the Linux targets, because three things rustc/cc-rs emit
+      # do not survive a trip through Zig unchanged:
+      #   * cc-rs passes `--target=<rust triple>`; cargo-zigbuild then re-suffixes
+      #     it with the glibc version into e.g.
+      #     `aarch64-unknown-linux-gnu.2.17`, which Zig cannot parse
+      #     ("UnknownOperatingSystem"). The wrapper drops it and pins
+      #     `-target <zig triple>.<glibc>` itself.
+      #   * rustc hardcodes `-Wl,--fix-cortex-a53-843419` for aarch64-linux-gnu
+      #     and Zig's bundled lld has no such option.
+      #   * tract-linalg compiles AArch64 kernels with GCC/clang `-march=` /
+      #     `-mcpu=` names that Zig rejects (`unknown CPU: 'armv8.2'`), and its
+      #     FP16 feature is spelled `fullfp16` in LLVM, so those flags are
+      #     translated for aarch64 only.
+      - name: Configure Zig cross tool wrappers
+        if: matrix.nightly != true
         shell: bash
         run: |
           set -euo pipefail
-          wrapper="$RUNNER_TEMP/zigcc-aarch64-filter.sh"
+          wrapper="$RUNNER_TEMP/zigcc.sh"
           cat > "$wrapper" <<'SH'
           #!/usr/bin/env bash
+          # Zig cross-compiler wrapper; JCODE_ZIG_TARGET selects the Zig target
+          # (with its glibc version) and JCODE_ZIG_DRIVER the Zig driver.
           set -euo pipefail
-          out=()
+          target="${JCODE_ZIG_TARGET:?JCODE_ZIG_TARGET must be set}"
+          arch="${target%%-*}"
+          args=()
           for arg in "$@"; do
             case "$arg" in
-              -Wl,--fix-cortex-a53-843419|-Wl,--fix-cortex-a53-843419=*) continue ;;
+              --target=*|-target=*) continue ;;
+              -Wl,--fix-cortex-a53-843419*) continue ;;
+              -march=*|--march=*|-mcpu=*|--mcpu=*)
+                [[ "$arch" == "aarch64" ]] || { args+=("$arg"); continue; }
+                key="${arg%%=*}"
+                value="${arg#*=}"
+                cpu="${value%%+*}"
+                feats="${value#"$cpu"}"
+                feats="${feats//+fp16/+fullfp16}"
+                case "$key" in
+                  # Zig takes LLVM CPU names, not GCC/clang -march names.
+                  -march|--march) arg="${key%march}mcpu=generic${feats}" ;;
+                  # Zig spells LLVM CPU names with underscores (cortex_a55).
+                  -mcpu|--mcpu) arg="${key}=${cpu//-/_}${feats}" ;;
+                esac
+                ;;
             esac
-            out+=("$arg")
+            args+=("$arg")
           done
-          exec zig cc -target aarch64-linux-gnu.2.17 "${out[@]}"
+          if [[ -n "${JCODE_ZIGCC_DEBUG:-}" ]]; then
+            printf '%s\n' "${args[@]+"${args[@]}"}"
+            exit 0
+          fi
+          exec zig "${JCODE_ZIG_DRIVER:-cc}" -target "$target" "${args[@]+"${args[@]}"}"
           SH
-          chmod +x "$wrapper"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$wrapper" >> "$GITHUB_ENV"
+          cxx="$RUNNER_TEMP/zigcxx.sh"
+          cat > "$cxx" <<'SH'
+          #!/usr/bin/env bash
+          export JCODE_ZIG_DRIVER=c++
+          exec "$(dirname "$0")/zigcc.sh" "$@"
+          SH
+          chmod +x "$wrapper" "$cxx"
+          {
+            echo "JCODE_ZIG_TARGET=${{ matrix.zig_target }}"
+            # cc-rs prefers CC_<triple>, but cargo-zigbuild leaves an existing
+            # CC_<triple_with_underscores> in place, so the underscored spelling
+            # is enough and keeps the env file to plain variable names.
+            echo "CARGO_TARGET_${{ matrix.env_triple }}_LINKER=$wrapper"
+            echo "CC_${{ matrix.triple }}=$wrapper"
+            echo "CXX_${{ matrix.triple }}=$cxx"
+          } >> "$GITHUB_ENV"
 
       # `windows-targets 0.48.5` links its import lib as `windows.0.48.5`, but
       # the owning crate's build script emits its search path only when TARGET
@@ -214,17 +283,22 @@ jobs:
         shell: bash
         env:
           JCODE_BUILD_SEMVER: ${{ env.JCODE_ZIP_TAG }}
+          JCODE_ZIP_FEATURES: ${{ matrix.features }}
         run: |
           set -euo pipefail
+          features=()
+          if [[ -n "${JCODE_ZIP_FEATURES:-}" ]]; then
+            features=(--features "$JCODE_ZIP_FEATURES")
+          fi
           if [[ "${{ matrix.nightly }}" == "true" ]]; then
             cargo +nightly zigbuild --locked --profile "$JCODE_ZIP_PROFILE" \
               -Z build-std=std,panic_abort \
               --target "${{ matrix.target }}" \
-              -p jcode --bin jcode
+              -p jcode --bin jcode "${features[@]+"${features[@]}"}"
           else
             cargo zigbuild --locked --profile "$JCODE_ZIP_PROFILE" \
               --target "${{ matrix.target }}" \
-              -p jcode --bin jcode
+              -p jcode --bin jcode "${features[@]+"${features[@]}"}"
           fi
 
       - name: Verify compatibility (glibc baseline / Windows 7)
