@@ -1106,6 +1106,33 @@ fn test_env_override_native_scrollbars() {
 }
 
 #[test]
+fn test_removed_pinned_diff_mode_falls_back_inline() {
+    let cfg: Config = toml::from_str(
+        "[display]\ndiff_mode = 'pinned'\ndiff_line_wrap = false\ncentered = true\n",
+    )
+    .expect("legacy pinned diff settings must not invalidate the config");
+    assert_eq!(cfg.display.diff_mode, DiffDisplayMode::Inline);
+    assert!(cfg.display.centered, "unrelated settings must survive");
+}
+
+#[test]
+fn test_env_override_removed_pinned_diff_mode_is_ignored() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_DIFF_MODE");
+    for removed in ["pinned", "pin"] {
+        crate::env::set_var("JCODE_DIFF_MODE", removed);
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.display.diff_mode, DiffDisplayMode::Inline);
+
+        cfg.display.diff_mode = DiffDisplayMode::File;
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.display.diff_mode, DiffDisplayMode::File);
+    }
+    restore_env_var("JCODE_DIFF_MODE", prev);
+}
+
+#[test]
 fn test_env_override_diff_mode_full_inline() {
     let _guard = crate::storage::lock_test_env();
     let prev = std::env::var_os("JCODE_DIFF_MODE");
@@ -1627,4 +1654,35 @@ fn swarm_root_effort_env_overrides_and_shared_resolution() {
     for (key, value) in keys.into_iter().zip(previous) {
         restore_env_var(key, value);
     }
+}
+
+#[test]
+fn anthropic_cache_preference_persists_and_preserves_other_settings() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().unwrap();
+    crate::env::set_var("JCODE_HOME", dir.path());
+    Config::invalidate_cache();
+    let path = Config::path().unwrap();
+    std::fs::write(&path, "[provider]\ndefault_model = 'keep-me'\n").unwrap();
+    assert!(crate::config::config().provider.anthropic_cache_ttl_1h);
+    for enabled in [false, true] {
+        Config::set_anthropic_cache_ttl_1h(enabled).unwrap();
+        Config::invalidate_cache();
+        assert_eq!(Config::load().provider.anthropic_cache_ttl_1h, enabled);
+        assert_eq!(crate::provider::anthropic::is_cache_ttl_1h(), enabled);
+        assert_eq!(
+            crate::config::config().provider.anthropic_cache_ttl_1h,
+            enabled
+        );
+        assert_eq!(
+            Config::load().provider.default_model.as_deref(),
+            Some("keep-me")
+        );
+    }
+    std::fs::write(&path, "[broken").unwrap();
+    assert!(Config::set_anthropic_cache_ttl_1h(false).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "[broken");
+    restore_env_var("JCODE_HOME", prev_home);
+    Config::invalidate_cache();
 }

@@ -81,8 +81,6 @@ pub enum DiffDisplayMode {
         alias = "full"
     )]
     FullInline,
-    /// Show diffs in a dedicated pinned pane.
-    Pinned,
     /// Show full file with diff highlights in side panel, synced to scroll position.
     File,
 }
@@ -96,24 +94,19 @@ impl DiffDisplayMode {
         matches!(self, Self::FullInline)
     }
 
-    pub fn is_pinned(&self) -> bool {
-        matches!(self, Self::Pinned)
-    }
-
     pub fn is_file(&self) -> bool {
         matches!(self, Self::File)
     }
 
     pub fn has_side_pane(&self) -> bool {
-        matches!(self, Self::Pinned | Self::File)
+        matches!(self, Self::File)
     }
 
     pub fn cycle(self) -> Self {
         match self {
             Self::Off => Self::Inline,
             Self::Inline => Self::FullInline,
-            Self::FullInline => Self::Pinned,
-            Self::Pinned => Self::File,
+            Self::FullInline => Self::File,
             Self::File => Self::Off,
         }
     }
@@ -123,8 +116,44 @@ impl DiffDisplayMode {
             Self::Off => "OFF",
             Self::Inline => "Inline",
             Self::FullInline => "Inline Full",
-            Self::Pinned => "Pinned",
             Self::File => "File",
+        }
+    }
+}
+
+#[cfg(test)]
+mod diff_display_mode_tests {
+    use super::DiffDisplayMode;
+
+    #[test]
+    fn diff_mode_cycle_keeps_inline_and_file_modes() {
+        use DiffDisplayMode::*;
+        let mut mode = Off;
+        for expected in [Inline, FullInline, File, Off, Inline] {
+            mode = mode.cycle();
+            assert_eq!(mode, expected);
+        }
+        for mode in [Off, Inline, FullInline, File] {
+            assert_eq!(mode.has_side_pane(), mode == File);
+            assert_eq!(mode.is_inline(), matches!(mode, Inline | FullInline));
+            assert_eq!(mode.is_full_inline(), mode == FullInline);
+            assert_eq!(mode.is_file(), mode == File);
+        }
+    }
+
+    #[test]
+    fn diff_mode_remaining_values_round_trip() {
+        for mode in [
+            DiffDisplayMode::Off,
+            DiffDisplayMode::Inline,
+            DiffDisplayMode::FullInline,
+            DiffDisplayMode::File,
+        ] {
+            let encoded = serde_json::to_string(&mode).unwrap();
+            assert_eq!(
+                serde_json::from_str::<DiffDisplayMode>(&encoded).unwrap(),
+                mode
+            );
         }
     }
 }
@@ -583,41 +612,29 @@ pub struct AgentsConfig {
     /// as chips on a single row.
     #[serde(default)]
     pub swarm_strip_layout: SwarmStripLayout,
-    /// Optional default model override for the memory sidecar.
+    /// Jev Decisions provider for recall: auto, openrouter, typesafe, aimlapi,
+    /// or jcode. Auto uses a provider-specific BYOK credential before Jcode.
+    #[serde(default = "default_memory_jev_provider")]
+    pub memory_jev_provider: String,
+    /// Minimum Jev relevance probability. Invalid values fail closed.
+    #[serde(default = "default_memory_jev_threshold")]
+    pub memory_jev_threshold: f32,
+    /// Optional model override for memory extraction only, never recall.
     pub memory_model: Option<String>,
-    /// Whether memory should use the sidecar for relevance/extraction.
-    ///
-    /// Defaults to `true`: the LLM precision-judge path is the only memory mode
-    /// that is reliably productive (injection precision ~1.0), so memory uses it
-    /// by default. Set to `false` only to deliberately opt into the lower-
-    /// precision no-LLM hybrid path. When sidecar mode is on but no LLM backend
-    /// is reachable, the memory runtime goes dormant instead of degrading to the
-    /// no-LLM path.
+    /// Whether optional automatic memory extraction may use a text-generating
+    /// sidecar. Recall always uses Jev and is independent of this setting.
     #[serde(default = "default_memory_sidecar_enabled")]
     pub memory_sidecar_enabled: bool,
-    /// Minimum turns between Mode-2 memory reranks (cadence floor). The
-    /// expensive listwise LLM rerank runs at most once per this many turns;
-    /// skipped turns fall back to hybrid-ordered surfacing. A topic change or
-    /// the first turn always forces a rerank regardless of cadence. 0 or 1 =
-    /// rerank every turn (no gating). Default 3.
+    /// Legacy setting, retained for config compatibility. Jev recall ignores it.
     #[serde(default = "default_memory_rerank_cadence")]
     pub memory_rerank_cadence: usize,
-    /// Number of independent LLM rerank "judges" to run per fired rerank. Their
-    /// votes are combined and only memories meeting `memory_rerank_min_agree`
-    /// agreement are injected. 1 = single judge (cheapest). 2 = two judges must
-    /// agree, which lifts injection precision to ~1.0 with ~100% clean-rate on
-    /// no-memory turns (offline adjudication), at 2 LLM calls per fired turn.
+    /// Legacy setting, retained for config compatibility. Jev recall ignores it.
     #[serde(default = "default_memory_rerank_votes")]
     pub memory_rerank_votes: usize,
-    /// Minimum judge agreement (of `memory_rerank_votes`) required to inject a
-    /// memory. Clamped to 1..=votes. Higher = stricter precision, lower recall.
+    /// Legacy setting, retained for config compatibility. Jev recall ignores it.
     #[serde(default = "default_memory_rerank_min_agree")]
     pub memory_rerank_min_agree: usize,
-    /// Which embedding backend memory dense-retrieval uses: `"local"` (bundled
-    /// all-MiniLM-L6-v2 ONNX, default, no network) or `"openai"` (remote
-    /// OpenAI/openai-compatible `/v1/embeddings`, opt-in, requires an
-    /// `OPENAI_API_KEY`). A keyless `"openai"` setting silently degrades to
-    /// local. Env override: `JCODE_MEMORY_EMBEDDING_BACKEND`.
+    /// Legacy benchmark/debug embedding backend. Jev recall never uses it.
     #[serde(default = "default_memory_embedding_backend")]
     pub memory_embedding_backend: String,
     /// OpenAI embedding model name when `memory_embedding_backend = "openai"`.
@@ -651,6 +668,14 @@ fn default_memory_embedding_backend() -> String {
     "local".to_string()
 }
 
+fn default_memory_jev_provider() -> String {
+    "auto".to_string()
+}
+
+fn default_memory_jev_threshold() -> f32 {
+    0.8
+}
+
 fn default_memory_sidecar_enabled() -> bool {
     true
 }
@@ -677,6 +702,8 @@ impl Default for AgentsConfig {
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             swarm_strip_layout: SwarmStripLayout::default(),
+            memory_jev_provider: default_memory_jev_provider(),
+            memory_jev_threshold: default_memory_jev_threshold(),
             memory_model: None,
             memory_sidecar_enabled: default_memory_sidecar_enabled(),
             memory_rerank_cadence: default_memory_rerank_cadence(),
@@ -1262,6 +1289,8 @@ pub struct ProviderConfig {
     pub openai_reasoning_effort: Option<String>,
     /// Reasoning effort for Anthropic Messages API output_config (none|low|medium|high|xhigh; max aliases to strongest supported)
     pub anthropic_reasoning_effort: Option<String>,
+    /// Request one-hour Anthropic prompt caching instead of five minutes.
+    pub anthropic_cache_ttl_1h: bool,
     /// OpenAI transport mode (auto|websocket|https)
     pub openai_transport: Option<String>,
     /// OpenAI service tier override (priority|flex)
@@ -1316,6 +1345,7 @@ impl Default for ProviderConfig {
             default_provider: None,
             openai_reasoning_effort: Some("low".to_string()),
             anthropic_reasoning_effort: None,
+            anthropic_cache_ttl_1h: true,
             openai_transport: None,
             openai_service_tier: Some("priority".to_string()),
             openai_native_compaction_mode: "auto".to_string(),

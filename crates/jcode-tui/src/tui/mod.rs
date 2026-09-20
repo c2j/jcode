@@ -33,9 +33,8 @@ mod core;
 pub(crate) mod fuzzy;
 // Terminal image display + metadata helpers now live in the dependency-free
 // `jcode-terminal-image` crate (shared with the `read` tool). Re-exported here
-// so existing `crate::tui::image` / `crate::tui::image_metadata` paths keep working.
+// so existing `crate::tui::image` paths keep working.
 pub use jcode_terminal_image::display as image;
-use jcode_terminal_image::metadata as image_metadata;
 pub mod info_widget;
 mod info_widget_layout;
 mod info_widget_overview;
@@ -581,7 +580,7 @@ pub trait TuiState {
     fn is_canary(&self) -> bool;
     /// Whether running in replay mode
     fn is_replay(&self) -> bool;
-    /// Diff display mode (off/inline/full-inline/pinned/file)
+    /// Diff display mode (off/inline/full-inline/file)
     fn diff_mode(&self) -> crate::config::DiffDisplayMode;
     /// Current session ID (if available)
     fn current_session_id(&self) -> Option<String>;
@@ -786,8 +785,6 @@ pub trait TuiState {
     fn chat_native_scrollbar(&self) -> bool;
     /// Whether to show a native terminal scrollbar for the side panel
     fn side_panel_native_scrollbar(&self) -> bool;
-    /// Whether to wrap lines in the pinned diff pane
-    fn diff_line_wrap(&self) -> bool;
     /// Interactive inline UI state (picker-like flows shown above input)
     // ---- Inline ----
     fn inline_interactive_state(&self) -> Option<&InlineInteractiveState>;
@@ -885,7 +882,7 @@ pub trait TuiState {
                 return true;
             }
             if let Some(cache_info) = self.cache_ttl_status()
-                && (cache_info.is_cold || cache_info.expiring_soon())
+                && cache_info.expiry_notification_active()
             {
                 return true;
             }
@@ -916,13 +913,15 @@ pub(crate) fn connection_type_icon(connection_type: Option<&str>) -> Option<&'st
 /// Cache TTL information for the current provider
 #[derive(Debug, Clone)]
 pub struct CacheTtlInfo {
-    /// Seconds until cache expires (0 = already expired)
+    /// Provider retention varies, so this countdown cannot establish a hit or expiry.
+    pub is_estimate: bool,
+    /// Seconds until the retention window ends (estimated for some providers)
     pub remaining_secs: u64,
     /// Total TTL for this provider in seconds
     pub ttl_secs: u64,
-    /// Whether the cache is expired (cold)
+    /// Whether the retention window elapsed, not proof of eviction for estimates
     pub is_cold: bool,
-    /// How long ago the cache went cold, in seconds (0 while warm)
+    /// How long ago the retention window ended, in seconds (0 before it ends)
     pub cold_for_secs: u64,
     /// Estimated cached tokens (from last response's input tokens)
     pub cached_tokens: Option<u64>,
@@ -970,7 +969,13 @@ impl CacheTtlInfo {
     /// Whether the cache is warm but close enough to expiry that the
     /// countdown should be shown (and idle redraws kept alive).
     pub fn expiring_soon(&self) -> bool {
-        !self.is_cold && self.remaining_secs <= self.warn_window_secs()
+        !self.is_estimate && !self.is_cold && self.remaining_secs <= self.warn_window_secs()
+    }
+
+    /// Only known TTLs may drive proactive expiry UI. An estimate or minimum
+    /// lifetime says nothing about when the provider will actually evict cache.
+    pub fn expiry_notification_active(&self) -> bool {
+        !self.is_estimate && (self.is_cold || self.expiring_soon())
     }
 }
 
@@ -1056,7 +1061,9 @@ fn min_cacheable_input_tokens(provider: &str, upstream_provider: Option<&str>) -
 }
 
 fn cache_expected_warm(cache_ttl: Option<&CacheTtlInfo>) -> bool {
-    cache_ttl.map(|info| !info.is_cold).unwrap_or(false)
+    cache_ttl
+        .map(|info| !info.is_cold && !info.is_estimate)
+        .unwrap_or(false)
 }
 
 /// Detect a KV/prompt-cache problem that is reliable enough to surface in the UI.
@@ -1899,6 +1906,7 @@ mod tests {
 
     fn warm_cache_ttl() -> CacheTtlInfo {
         CacheTtlInfo {
+            is_estimate: false,
             remaining_secs: 240,
             ttl_secs: 300,
             is_cold: false,
@@ -1909,12 +1917,21 @@ mod tests {
 
     fn cold_cache_ttl() -> CacheTtlInfo {
         CacheTtlInfo {
+            is_estimate: false,
             remaining_secs: 0,
             ttl_secs: 300,
             is_cold: true,
             cold_for_secs: 90,
             cached_tokens: Some(12_000),
         }
+    }
+
+    #[test]
+    fn cache_estimate_is_not_evidence_of_an_expected_warm_hit() {
+        let mut timer = warm_cache_ttl();
+        assert!(super::cache_expected_warm(Some(&timer)));
+        timer.is_estimate = true;
+        assert!(!super::cache_expected_warm(Some(&timer)));
     }
 
     #[test]
