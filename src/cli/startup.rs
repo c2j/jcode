@@ -69,6 +69,11 @@ pub async fn run() -> Result<()> {
         crate::auth::external::load_api_key_for_env,
     );
 
+    // Let provider settings resolved inside the provider-metadata leaf crate
+    // (such as the plain-HTTP host allowlist) be read from the provider env
+    // file, which this layer is the only one able to locate.
+    crate::provider_catalog::install_provider_env_file_value_resolver();
+
     // Register externally-implemented provider runtimes with the base
     // provider registry. These crates sit downstream of jcode-base (so
     // provider edits do not rebuild the app spine), which means base cannot

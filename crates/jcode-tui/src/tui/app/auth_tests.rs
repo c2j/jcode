@@ -14,6 +14,7 @@ fn with_temp_jcode_home<T>(f: impl FnOnce() -> T) -> T {
         "JCODE_OPENAI_COMPAT_SETUP_URL",
         "JCODE_OPENAI_COMPAT_DEFAULT_MODEL",
         "JCODE_OPENAI_COMPAT_LOCAL_ENABLED",
+        "JCODE_ALLOW_INSECURE_HTTP_HOSTS",
         "OPENAI_COMPAT_API_KEY",
     ]
     .map(|key| (key, std::env::var_os(key)));

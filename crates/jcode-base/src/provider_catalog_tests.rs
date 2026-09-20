@@ -354,6 +354,9 @@ fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_internatio
 
 #[test]
 fn auth_issue_lan_openai_compatible_bases_are_valid_for_local_model_servers() {
+    let _lock = crate::storage::lock_test_env();
+    let _guard = EnvGuard::save(&["JCODE_HOME", "JCODE_ALLOW_INSECURE_HTTP_HOSTS"]);
+    crate::env::remove_var("JCODE_ALLOW_INSECURE_HTTP_HOSTS");
     assert_eq!(
         normalize_api_base("http://100.103.78.84:11434/v1").as_deref(),
         Some("http://100.103.78.84:11434/v1")
@@ -363,6 +366,41 @@ fn auth_issue_lan_openai_compatible_bases_are_valid_for_local_model_servers() {
         Some("http://hsv.local:11434/v1")
     );
     assert_eq!(normalize_api_base("http://example.com/v1"), None);
+}
+
+/// The plain-HTTP allowlist is a provider setting, so it must also work when it
+/// is saved in the OpenAI-compatible env file instead of the process env.
+#[test]
+fn allow_insecure_http_hosts_reads_openai_compatible_env_file() {
+    let _lock = crate::storage::lock_test_env();
+    let _guard = EnvGuard::save(&["JCODE_HOME", "JCODE_ALLOW_INSECURE_HTTP_HOSTS"]);
+    let temp = tempfile::tempdir().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::remove_var("JCODE_ALLOW_INSECURE_HTTP_HOSTS");
+    crate::provider_catalog::install_provider_env_file_value_resolver();
+
+    assert_eq!(normalize_api_base("http://api.example.com/v1"), None);
+
+    let config_dir = temp.path().join("config").join("jcode");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join(OPENAI_COMPAT_PROFILE.env_file),
+        "JCODE_ALLOW_INSECURE_HTTP_HOSTS=api.example.com\n",
+    )
+    .expect("write env file");
+
+    assert_eq!(
+        normalize_api_base("http://api.example.com/v1").as_deref(),
+        Some("http://api.example.com/v1")
+    );
+
+    // The process environment still takes precedence over the env file.
+    crate::env::set_var("JCODE_ALLOW_INSECURE_HTTP_HOSTS", "other.example.net");
+    assert_eq!(
+        normalize_api_base("http://other.example.net/v1").as_deref(),
+        Some("http://other.example.net/v1")
+    );
+    assert_eq!(normalize_api_base("http://api.example.com/v1"), None);
 }
 
 #[test]

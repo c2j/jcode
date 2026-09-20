@@ -573,7 +573,15 @@ OPENAI_COMPAT_API_KEY=your-token-here
 Notes:
 
 - `jcode login --provider openai-compatible` can create or update this for you.
-- Plain `http://` is accepted for `localhost` and private LAN IPs. Public remote HTTP is still rejected.
+- Plain `http://` is accepted for `localhost`, `*.local`, and private LAN IPs. Public remote HTTP is rejected by default.
+- To use a public `http://` endpoint anyway, opt in explicitly with `JCODE_ALLOW_INSECURE_HTTP_HOSTS` (comma-separated hosts):
+
+  ```bash
+  # exact host, subdomain wildcard, or host:port
+  JCODE_ALLOW_INSECURE_HTTP_HOSTS=llm.corp.example,*.lab.example:8080
+  ```
+
+  Entries match case-insensitively. `*.example.com` (or `.example.com`) matches subdomains only, `host:port` also requires the port to match, and `*` allows every HTTP host. The variable can be exported or placed in the provider env file.
 - HTTPS endpoints work as usual.
 
 #### MCP config files
