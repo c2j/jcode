@@ -775,6 +775,10 @@ pub enum ServerEvent {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
 
+    /// Assistant text message boundary within a provider response.
+    #[serde(rename = "text_done")]
+    TextDone,
+
     /// Streaming reasoning/thinking delta (raw, unformatted model text).
     ///
     /// Unlike [`ServerEvent::TextDelta`], this carries the model's reasoning as
@@ -1308,7 +1312,9 @@ pub enum ServerEvent {
 
     /// Usage delta for a route, independent of catalog availability or Agent locks.
     #[serde(rename = "model_usage_updated")]
-    ModelUsageUpdated { route: jcode_provider_core::ModelRoute },
+    ModelUsageUpdated {
+        route: jcode_provider_core::ModelRoute,
+    },
 
     /// Available models updated (pushed after auth changes)
     #[serde(rename = "available_models_updated")]

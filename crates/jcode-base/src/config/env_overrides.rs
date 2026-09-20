@@ -161,7 +161,6 @@ impl Config {
                 | "inlinefull" | "full" => {
                     self.display.diff_mode = DiffDisplayMode::FullInline;
                 }
-                "pinned" | "pin" => self.display.diff_mode = DiffDisplayMode::Pinned,
                 "file" => self.display.diff_mode = DiffDisplayMode::File,
                 _ => {}
             }
@@ -187,11 +186,6 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_DISPLAY_CENTERED") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.centered = parsed;
-            }
-        }
-        if let Ok(v) = std::env::var("JCODE_DIFF_LINE_WRAP") {
-            if let Some(parsed) = parse_env_bool(&v) {
-                self.display.diff_line_wrap = parsed;
             }
         }
         if let Ok(v) = std::env::var("JCODE_QUEUE_MODE") {
@@ -418,6 +412,9 @@ impl Config {
             if let Ok(parsed) = v.trim().parse::<usize>() {
                 self.agents.swarm_max_concurrent_agents = parsed;
             }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_JEV_PROVIDER") {
+            self.agents.memory_jev_provider = v.trim().to_ascii_lowercase();
         }
         if let Ok(v) = std::env::var("JCODE_MEMORY_MODEL") {
             let trimmed = v.trim();
