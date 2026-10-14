@@ -21,6 +21,7 @@ fn test_remote_done_shows_footer_after_final_tool_result_without_trailing_text()
     );
     app.handle_server_event(
         crate::protocol::ServerEvent::ToolInput {
+            id: None,
             delta: r#"{"file_path":"src/main.rs","start_line":1,"end_line":2}"#.to_string(),
         },
         &mut remote,
@@ -364,6 +365,7 @@ fn test_remote_rewind_completion_shows_undo_hint_after_history_refresh() {
             provider_name: Some("mock".to_string()),
             provider_model: Some("mock-model".to_string()),
             subagent_model: None,
+            agent_model_overrides: Default::default(),
             autoreview_enabled: None,
             autojudge_enabled: None,
             available_models: vec![],
@@ -390,6 +392,7 @@ fn test_remote_rewind_completion_shows_undo_hint_after_history_refresh() {
             compaction_mode: crate::config::CompactionMode::Reactive,
             activity: None,
             side_panel: crate::side_panel::SidePanelSnapshot::default(),
+            applets: Default::default(),
         },
         &mut remote,
     );

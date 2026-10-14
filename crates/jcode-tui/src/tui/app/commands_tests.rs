@@ -22,10 +22,7 @@ fn parse_diff_mode_name_maps_known_aliases() {
 #[test]
 fn parse_diff_mode_name_is_case_insensitive_and_trims() {
     use crate::config::DiffDisplayMode;
-    assert_eq!(
-        parse_diff_mode_name("  FILE "),
-        Some(DiffDisplayMode::File)
-    );
+    assert_eq!(parse_diff_mode_name("  FILE "), Some(DiffDisplayMode::File));
 }
 
 #[test]
@@ -118,6 +115,16 @@ fn transient_server_error_remains_retryable_for_auto_poke() {
     use super::is_non_retryable_auto_poke_error;
     let err = "OpenAI-compatible chat request failed\n  status: 503 Service Unavailable";
     assert!(!is_non_retryable_auto_poke_error(err));
+}
+
+#[test]
+fn rejected_refresh_token_is_non_retryable_for_auto_poke() {
+    assert!(super::is_non_retryable_auto_poke_error(
+        "Claude OAuth refresh token was previously rejected by Anthropic and cannot be refreshed. Run `jcode login --provider claude` to mint a fresh token."
+    ));
+    assert!(!super::is_non_retryable_auto_poke_error(
+        "Claude token refresh failed: 503 Service Unavailable"
+    ));
 }
 
 #[test]

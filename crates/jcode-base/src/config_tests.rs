@@ -154,6 +154,19 @@ fn swarm_spawn_mode_defaults_to_inline() {
 }
 
 #[test]
+fn swarm_stall_watchdog_defaults_and_parses() {
+    let defaults = Config::default().agents;
+    assert_eq!(defaults.swarm_stall_after_secs, 600);
+    assert!(!defaults.swarm_stall_nudge);
+
+    let cfg: Config =
+        toml::from_str("[agents]\nswarm_stall_after_secs = 0\nswarm_stall_nudge = true\n")
+            .expect("stall watchdog settings should parse");
+    assert_eq!(cfg.agents.swarm_stall_after_secs, 0);
+    assert!(cfg.agents.swarm_stall_nudge);
+}
+
+#[test]
 fn swarm_max_concurrent_agents_defaults_to_safe_live_worker_budget() {
     // Keep enough parallelism for deep fan-out without allowing recursive ad hoc
     // spawns to grow until the 1000-member hard cap exhausts machine memory.
@@ -1685,4 +1698,55 @@ fn anthropic_cache_preference_persists_and_preserves_other_settings() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "[broken");
     restore_env_var("JCODE_HOME", prev_home);
     Config::invalidate_cache();
+}
+
+#[test]
+fn cli_config_save_round_trips_desktop_tables() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", dir.path());
+    Config::invalidate_cache();
+
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[display]\ncentered = false\n\n[desktop.voice]\nglobal_hold = true\n\
+         global_devices = [\"/dev/input/event3\"]\n\n[desktop.appearance]\ntheme = \"warm-neutral\"\n",
+    )
+    .unwrap();
+
+    // A CLI read-modify-write must not drop Desktop-owned settings.
+    Config::set_default_model(Some("gpt-test"), None).expect("save");
+    let saved: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let desktop = saved["desktop"].as_table().expect("desktop table kept");
+    assert_eq!(desktop["voice"]["global_hold"].as_bool(), Some(true));
+    assert_eq!(
+        desktop["voice"]["global_devices"][0].as_str(),
+        Some("/dev/input/event3")
+    );
+    assert_eq!(
+        desktop["appearance"]["theme"].as_str(),
+        Some("warm-neutral")
+    );
+
+    // Configs without Desktop tables stay free of an empty [desktop] header.
+    std::fs::write(&path, "[display]\ncentered = false\n").unwrap();
+    Config::set_default_model(Some("gpt-test"), None).expect("save");
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("[desktop"));
+
+    restore_env_var("JCODE_HOME", prev_home);
+    Config::invalidate_cache();
+}
+
+/// `display.overscroll_status` was removed; configs that still set it (users
+/// had `"on"` written by older versions) must load without losing settings.
+#[test]
+fn removed_overscroll_status_key_still_loads_config() {
+    let config = toml::from_str::<Config>(
+        "[display]\ncentered = true\noverscroll_status = \"on\"\nusage_display = \"used\"\n",
+    )
+    .expect("legacy key must not break config");
+    assert!(config.display.centered);
+    assert_eq!(config.display.usage_display, "used");
 }

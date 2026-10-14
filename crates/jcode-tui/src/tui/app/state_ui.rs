@@ -9,6 +9,7 @@ pub(super) struct RestoredReloadInput {
     pub pending_images: Vec<(String, String)>,
     pub submit_on_restore: bool,
     pub queued_messages: Vec<String>,
+    pub queued_commands: Vec<String>,
     pub hidden_queued_system_messages: Vec<String>,
     pub startup_status_notice: Option<String>,
     pub startup_display_message: Option<(String, String)>,
@@ -24,6 +25,7 @@ pub(super) struct RestoredReloadInput {
     pub todos_view_enabled: bool,
     pub todo_confidence_spike_challenged: bool,
     pub last_todo_ownership_fingerprint: Option<String>,
+    pub final_response_todo_fingerprint: Option<String>,
 }
 
 impl App {
@@ -122,7 +124,7 @@ impl App {
             return;
         }
 
-        if crate::dictation::remember_last_focused_session(&session_id).is_ok() {
+        if crate::client_focus::remember_last_focused_session(&session_id).is_ok() {
             self.last_client_focus_recorded_at = Some(Instant::now());
             self.last_client_focus_session_id = Some(session_id);
         }
@@ -247,6 +249,7 @@ impl App {
         if self.input.is_empty()
             && self.pending_images.is_empty()
             && self.queued_messages.is_empty()
+            && self.queued_commands.is_empty()
             && self.hidden_queued_system_messages.is_empty()
             && self.interleave_message.is_none()
             && self.pending_soft_interrupts.is_empty()
@@ -258,6 +261,7 @@ impl App {
             && !self.todos_view_enabled
             && !self.todo_confidence_spike_challenged
             && self.last_todo_ownership_fingerprint.is_none()
+            && self.final_response_todo_fingerprint.is_none()
         {
             // Nothing to save, but a stale file from an earlier run could
             // still hold old queued messages/input. Leaving it behind would
@@ -336,6 +340,7 @@ impl App {
                 })).collect::<Vec<_>>(),
                 "submit_on_restore": resume_prompt.is_some(),
                 "queued_messages": queued_messages,
+                "queued_commands": self.queued_commands,
                 "hidden_queued_system_messages": hidden_queued_system_messages,
                 "interleave_message": self.interleave_message,
                 "pending_soft_interrupts": self.pending_soft_interrupts,
@@ -349,6 +354,7 @@ impl App {
                 "todos_view_enabled": self.todos_view_enabled,
                 "todo_confidence_spike_challenged": self.todo_confidence_spike_challenged,
                 "last_todo_ownership_fingerprint": self.last_todo_ownership_fingerprint,
+                "final_response_todo_fingerprint": self.final_response_todo_fingerprint,
             });
             let _ = std::fs::write(&path, data.to_string());
         }
@@ -431,6 +437,16 @@ impl App {
                 .unwrap_or(false);
             let queued_messages = value
                 .get("queued_messages")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let queued_commands = value
+                .get("queued_commands")
                 .and_then(|v| v.as_array())
                 .map(|items| {
                     items
@@ -576,6 +592,7 @@ impl App {
                 pending_images,
                 submit_on_restore,
                 queued_messages,
+                queued_commands,
                 hidden_queued_system_messages,
                 startup_status_notice,
                 startup_display_message,
@@ -590,6 +607,10 @@ impl App {
                 split_view_enabled,
                 todos_view_enabled,
                 todo_confidence_spike_challenged,
+                final_response_todo_fingerprint: value
+                    .get("final_response_todo_fingerprint")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
                 last_todo_ownership_fingerprint: value
                     .get("last_todo_ownership_fingerprint")
                     .and_then(|v| v.as_str())
@@ -606,6 +627,7 @@ impl App {
             pending_images: Vec::new(),
             submit_on_restore: false,
             queued_messages: Vec::new(),
+            queued_commands: Vec::new(),
             hidden_queued_system_messages: Vec::new(),
             startup_status_notice: None,
             startup_display_message: None,
@@ -621,6 +643,7 @@ impl App {
             todos_view_enabled: false,
             todo_confidence_spike_challenged: false,
             last_todo_ownership_fingerprint: None,
+            final_response_todo_fingerprint: None,
         })
     }
 
@@ -698,6 +721,9 @@ impl App {
         }
         self.last_side_panel_refresh = None;
         self.side_panel = snapshot;
+        if self.side_panel.focused_page().is_none() {
+            self.side_panel_fullscreen = false;
+        }
         self.note_runtime_memory_event("side_panel_updated", "side_panel_snapshot_applied");
         if focused_changed {
             self.diff_pane_scroll = 0;
@@ -1918,10 +1944,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
                 app.set_status_notice("Cache stats");
             }
             "extend" | "1h" | "1hour" | "extended" | "5m" | "5min" | "default" | "reset" => {
-                let enabled = match arg {
-                    "5m" | "5min" | "default" | "reset" => false,
-                    _ => true,
-                };
+                let enabled = !matches!(arg, "5m" | "5min" | "default" | "reset");
                 match crate::config::Config::set_anthropic_cache_ttl_1h(enabled) {
                     Ok(()) => {
                         let message = if enabled {

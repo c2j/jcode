@@ -65,7 +65,7 @@ impl App {
             .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("unknown"))
     }
 
-    fn configured_remote_provider_hint(&self) -> Option<String> {
+    pub(super) fn configured_remote_provider_hint(&self) -> Option<String> {
         if crate::tui::is_ssh_remote() {
             return None;
         }
@@ -656,6 +656,10 @@ impl crate::tui::TuiState for App {
         &self.queued_messages
     }
 
+    fn queued_commands(&self) -> &[String] {
+        &self.queued_commands
+    }
+
     fn interleave_message(&self) -> Option<&str> {
         self.interleave_message.as_deref()
     }
@@ -676,24 +680,13 @@ impl crate::tui::TuiState for App {
         self.terminal_clear_collapsed()
     }
 
+    fn pending_resize_anchor(&self) -> Option<jcode_tui_messages::ContentPos> {
+        self.pending_resize_anchor.map(|pending| pending.target)
+    }
+
     fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
         self.pending_history_anchor
             .map(|anchor| anchor.lines_from_bottom)
-    }
-
-    fn chat_overscroll_active(&self) -> bool {
-        self.chat_overscroll_active()
-    }
-
-    fn chat_overscroll_pinned(&self) -> bool {
-        matches!(
-            self.overscroll_status_mode,
-            crate::config::OverscrollStatusMode::On
-        )
-    }
-
-    fn chat_overscroll_remaining(&self) -> Option<f32> {
-        self.chat_overscroll_remaining()
     }
 
     fn copy_selection_edge_autoscroll_active(&self) -> bool {
@@ -978,6 +971,10 @@ impl crate::tui::TuiState for App {
         self.remote_client_count
     }
 
+    fn voice_input_status(&self) -> Option<(bool, String)> {
+        self.voice_input_status_line()
+    }
+
     fn status_notice(&self) -> Option<String> {
         if !self.is_remote
             && self.provider.uses_jcode_compaction()
@@ -989,7 +986,7 @@ impl crate::tui::TuiState for App {
             ));
         }
         self.status_notice.as_ref().and_then(|(text, at)| {
-            if at.elapsed() <= Duration::from_secs(3) {
+            if at.elapsed() <= STATUS_NOTICE_TTL {
                 Some(text.clone())
             } else {
                 None
@@ -1229,6 +1226,13 @@ impl crate::tui::TuiState for App {
                         }
                         ContentBlock::OpenAICompaction { encrypted_content } => {
                             user_chars += encrypted_content.len();
+                        }
+                        ContentBlock::ToolReference { tool_name, .. } => {
+                            user_chars += tool_name.len();
+                        }
+                        ContentBlock::ProviderNative { item, .. } => {
+                            tool_result_count += 1;
+                            tool_result_chars += item.to_string().len();
                         }
                     }
                 }
@@ -1524,13 +1528,15 @@ impl crate::tui::TuiState for App {
             None
         };
 
-        // Gather background task info
+        // Gather background task info. Session-scoped rows come from task
+        // events (works when tasks run in the server process). The global
+        // manager only knows tasks spawned in this process.
         let background_info = {
-            // Get running background tasks count
             let bg_manager = crate::background::global();
             let (running_count, running_tasks, progress) = bg_manager.running_snapshot();
+            let rows = self.background_task_rows_ref().to_vec();
 
-            if running_count > 0 {
+            if running_count > 0 || !rows.is_empty() {
                 Some(crate::tui::info_widget::BackgroundInfo {
                     running_count,
                     running_tasks,
@@ -1540,6 +1546,7 @@ impl crate::tui::TuiState for App {
                         .and_then(|progress| progress.detail.clone()),
                     memory_agent_active: false,
                     memory_agent_turns: 0,
+                    rows,
                 })
             } else {
                 None
@@ -1689,6 +1696,7 @@ impl crate::tui::TuiState for App {
                 false
             },
             git_info: gather_git_info(),
+            agent_edited: self.agent_edited_paths(),
         }
     }
 
@@ -1894,6 +1902,9 @@ impl crate::tui::TuiState for App {
     fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot {
         &self.side_panel
     }
+    fn side_panel_fullscreen(&self) -> bool {
+        self.side_panel_fullscreen
+    }
     fn pin_images(&self) -> bool {
         self.pin_images && !self.side_panel_user_hidden
     }
@@ -1952,6 +1963,10 @@ impl crate::tui::TuiState for App {
     fn model_status_overlay(&self) -> Option<(usize, &str)> {
         self.model_status_scroll
             .map(|scroll| (scroll, self.model_status_content.as_str()))
+    }
+
+    fn commit_log_overlay(&self) -> Option<&crate::tui::app::CommitLogOverlay> {
+        self.commit_log_overlay.as_ref()
     }
 
     fn session_picker_overlay(

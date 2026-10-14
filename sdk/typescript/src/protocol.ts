@@ -8,7 +8,9 @@
  */
 
 export const API_VERSION_MAJOR = 1;
-export const API_VERSION_MINOR = 6;
+export const API_VERSION_MINOR = 10;
+
+export type RuntimeCommand = "skills" | "context" | "info" | "cache" | "memory" | "swarm" | "agents" | "subagent_model" | "autoreview" | "autojudge" | "transport" | "fast" | "telemetry" | "subscription" | "overnight" | "productivity" | "initiatives" | "premium" | "provider_test_coverage" | "refresh_model_list" | "continue" | "resume_all" | "remote" | "server_reload" | "review" | "judge" | "subagent" | "auth" | "logout";
 
 export type PermissionDecision = "allow" | "allow_always" | "deny";
 
@@ -78,6 +80,22 @@ export interface TextMatch {
   preview: string;
 }
 
+/** A session's persisted todo state, as read by the follow-up policy.
+ * Todos, plan, goals, and observations use the runtime's todo schema. */
+export interface TodoSnapshot {
+  todos: Array<Record<string, unknown>>;
+  plan: Record<string, unknown>;
+  goals: Array<Record<string, unknown>>;
+  gate_observations: Array<Record<string, unknown>>;
+  long_session_review_due: boolean;
+}
+
+/** Persistent effects of a follow-up decision. */
+export interface TodoEffects {
+  clear_gate_observations?: boolean;
+  mark_long_session_review_delivered?: boolean;
+}
+
 /** Durable raw provider counts summed over all assistant rounds in one user turn.
  * Missing metrics are unknown, not zero. Cache accounting differs by provider.
  * Restored duration is currently unavailable. */
@@ -119,16 +137,34 @@ export interface RenderedImage {
 /** Base64 image attachment: [mediaType, base64Data]. */
 export type ImageAttachment = [string, string];
 
+/** A tool definition exposed to the model. */
+export interface SessionToolDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+/** Wire-level session tool policy. Callback functions never cross the wire. */
+export interface ToolConfiguration {
+  enabled?: string[] | null;
+  disabled?: string[];
+  custom?: SessionToolDefinition[];
+}
+
 export type ApiRequest =
   | { req: "hello"; min_version: number; max_version: number; client: string }
   | { req: "list_sessions"; include_archived?: boolean; limit?: number }
   | { req: "archive_session"; session_id: string }
   | { req: "restore_session"; session_id: string }
   | { req: "set_retention_policy"; archive_after_days?: number }
-  | { req: "create_session"; working_dir?: string }
+  | { req: "create_session"; working_dir?: string; system_prompt?: string }
   | { req: "attach_session"; session_id: string }
   | { req: "fork_session"; session_id: string }
+  | { req: "transfer_session"; session_id: string }
   | { req: "detach_session"; session_id: string }
+  | { req: "configure_tools"; session_id: string; tools: ToolConfiguration }
+  | { req: "list_tools"; session_id: string }
+  | { req: "tool_result"; session_id: string; call_id: string; output: string; error?: string }
   | {
       req: "send_message";
       session_id: string;
@@ -144,6 +180,8 @@ export type ApiRequest =
       content: string;
       images?: ImageAttachment[];
       urgent?: boolean;
+      /** Opaque id echoed in `soft_interrupt_injected` and accepted by a filtered cancel. */
+      client_id?: string;
     }
   | { req: "get_history"; session_id: string }
   | { req: "peek_session"; session_id: string; limit?: number }
@@ -157,19 +195,36 @@ export type ApiRequest =
     }
   | { req: "list_models"; session_id: string }
   | { req: "get_runtime_info"; session_id: string }
+  | { req: "runtime_command"; session_id: string; command: RuntimeCommand; args?: string[] }
   | { req: "set_api_key"; provider: string; api_key: string }
   | { req: "notify_auth_changed"; provider: string }
+  | { req: "invalidate_usage"; provider: string; account_label?: string }
   | { req: "clear_api_key"; provider: string }
   | { req: "read_file"; session_id: string; path: string; max_bytes?: number }
   | { req: "find_files"; session_id: string; query: string; limit?: number }
   | { req: "search_text"; session_id: string; query: string; path?: string; limit?: number }
   | { req: "file_status"; session_id: string; path: string }
+  | { req: "get_todo_state"; session_id: string }
+  | { req: "ack_todo_follow_up"; session_id: string; effects: TodoEffects }
   | { req: "set_model"; session_id: string; model: string }
   | { req: "set_reasoning_effort"; session_id: string; effort: string }
   | { req: "compact"; session_id: string }
   | { req: "rename_session"; session_id: string; title?: string }
+  | { req: "set_session_saved"; session_id: string; saved: boolean; label?: string }
+  | {
+      req: "applet_action";
+      session_id: string;
+      instance: string;
+      action: AppletAction;
+      state?: Record<string, unknown>;
+      source_key?: string;
+    }
+  | { req: "close_applet"; session_id: string; instance: string }
   | { req: "rewind_undo"; session_id: string }
-  | { req: "cancel_soft_interrupts"; session_id: string }
+  /** Without `client_ids`, clears the queue (replies `ok`). With them, replies `soft_interrupts_cancelled`. */
+  | { req: "cancel_soft_interrupts"; session_id: string; client_ids?: string[] }
+  /** Replies `background_tool_result` when the `background_tool_result` capability is advertised, else `ok`. */
+  | { req: "background_tool"; session_id: string }
   | { req: "ping" };
 
 /** Markdown/PDF panel state, shared with the native runtime. */
@@ -186,6 +241,33 @@ export interface SidePanelPage {
   pdf_data?: string;
   updated_at_ms: number;
 }
+/** A user intent from an applet node (`jcode.applet/1`). */
+export interface AppletAction {
+  action: string;
+  args?: unknown;
+}
+
+/** One mounted applet instance. `document` follows the `jcode.applet/1` schema. */
+export interface AppletInstance {
+  id: string;
+  applet: string;
+  placement: { kind: string; [key: string]: unknown };
+  scope?: { kind: string; [key: string]: unknown };
+  lifetime?: "ephemeral" | "session" | "persistent";
+  document: {
+    revision: number;
+    title: string;
+    view: { type: string; [key: string]: unknown };
+    state?: Record<string, unknown>;
+    assets?: unknown[];
+  };
+}
+
+/** All agent-mounted applet instances for one session, in mount order. */
+export interface AgentApplets {
+  instances: AppletInstance[];
+}
+
 export interface SidePanelSnapshot {
   /** Monotonic explicit-focus intent. Absent on older servers. */
   focus_revision?: number;
@@ -197,6 +279,7 @@ export interface SidePanelSnapshot {
 export type ApiEvent =
   | { ev: "hello_ok"; version: number; server: string; capabilities?: string[] }
   | { ev: "ok" }
+  | { ev: "runtime_command_result"; session_id: string; command: RuntimeCommand; data: unknown; message: string }
   | { ev: "error"; code: ErrorCode; message: string }
   | { ev: "sessions"; sessions: SessionInfo[] }
   | { ev: "attached"; session: SessionInfo }
@@ -211,6 +294,8 @@ export type ApiEvent =
   | { ev: "tool_start"; session_id: string; call_id: string; name: string }
   | { ev: "tool_input_delta"; session_id: string; call_id: string; delta: string }
   | { ev: "tool_exec"; session_id: string; call_id: string; name: string }
+  | { ev: "tools"; session_id: string; tools: SessionToolDefinition[] }
+  | { ev: "tool_call"; session_id: string; call_id: string; name: string; input: unknown }
   | {
       ev: "tool_done";
       session_id: string;
@@ -220,6 +305,7 @@ export type ApiEvent =
       error?: string;
     }
   | { ev: "side_panel_state"; session_id: string; snapshot: SidePanelSnapshot }
+  | { ev: "applet_state"; session_id: string; snapshot: AgentApplets }
   | { ev: "side_pane_images"; session_id: string; images: RenderedImage[] }
   | {
       ev: "token_usage";
@@ -229,7 +315,38 @@ export type ApiEvent =
       cache_read_input?: number;
       cache_creation_input?: number;
     }
-  | { ev: "turn_done"; session_id: string }
+  | {
+      ev: "kv_cache_miss";
+      session_id: string;
+      reason: string;
+      harness_caused: boolean;
+      missed_tokens: number;
+      expected_tokens: number;
+      read_tokens: number;
+      documented_cause?: string;
+      message: string;
+    }
+  | { ev: "turn_stopped"; session_id: string; reason: TurnStopReason; message: string; provider_stop_reason?: string }
+  /** `pending_soft_interrupts`: queued messages this turn never saw (only when nonzero). */
+  | { ev: "turn_done"; session_id: string; pending_soft_interrupts?: number }
+  /**
+   * Queued soft interrupts reached the model. Output after this event was written
+   * having seen them. Several queued messages arrive as one user message, so
+   * `client_ids` lists every id delivered, in queue order. `point` is B, C, D, or
+   * `turn_start` (sent while idle, so it started a turn).
+   */
+  | {
+      ev: "soft_interrupt_injected";
+      session_id: string;
+      client_ids: string[];
+      point: string;
+      tools_skipped?: number;
+      display_role?: string;
+    }
+  /** Reply to a filtered `cancel_soft_interrupts`. Decided atomically against delivery. */
+  | { ev: "soft_interrupts_cancelled"; cancelled: string[]; not_queued: string[] }
+  /** Reply to `background_tool`. */
+  | { ev: "background_tool_result"; moved: boolean; tool_call_id?: string; tool_name?: string }
   | {
       ev: "wake_requested";
       session_id: string;
@@ -255,7 +372,7 @@ export type ApiEvent =
     }
   /** Attachment recovery intent. Can precede attached. Never auto-sent by the bridge. */
   | { ev: "session_recovery"; session_id: string; continuation_message: string; reconnect_notice?: string }
-  | { ev: "session_status"; session_id: string; status: string }
+  | { ev: "session_status"; session_id: string; status: string; pending_soft_interrupts?: number }
   | { ev: "connection_phase"; session_id: string; phase: string }
   | {
       ev: "model_info";
@@ -263,6 +380,7 @@ export type ApiEvent =
       provider?: string;
       model?: string;
       reasoning_effort?: string;
+      auth_method?: string;
     }
   | { ev: "models"; session_id: string; models: string[]; current?: string }
   | {
@@ -271,6 +389,7 @@ export type ApiEvent =
       provider?: string;
       model?: string;
       reasoning_effort?: string;
+      auth_method?: string;
       routes: ModelRouteInfo[];
     }
   | { ev: "credential_updated"; provider: string; configured: boolean }
@@ -293,6 +412,7 @@ export type ApiEvent =
       size?: number;
       modified_ms?: number;
     }
+  | { ev: "todo_state"; session_id: string; state: TodoSnapshot }
   | { ev: "compacted"; session_id: string; message: string }
   | {
       ev: "session_renamed";
@@ -333,6 +453,7 @@ export type ServerFrame = { v: number; reply_to?: number } & UnknownApiEvent;
 
 /** Every event tag the SDK knows about, for drift checks and routing. */
 export const KNOWN_EVENT_KINDS = [
+  "runtime_command_result",
   "hello_ok",
   "ok",
   "error",
@@ -342,6 +463,7 @@ export const KNOWN_EVENT_KINDS = [
   "history",
   "side_pane_images",
   "side_panel_state",
+  "applet_state",
   "pong",
   "text_delta",
   "text_done",
@@ -349,11 +471,18 @@ export const KNOWN_EVENT_KINDS = [
   "reasoning_delta",
   "reasoning_done",
   "tool_start",
+  "tools",
+  "tool_call",
   "tool_input_delta",
   "tool_exec",
   "tool_done",
   "token_usage",
+  "kv_cache_miss",
   "turn_done",
+  "soft_interrupt_injected",
+  "soft_interrupts_cancelled",
+  "background_tool_result",
+  "turn_stopped",
   "wake_requested",
   "background_progress",
   "message_accepted",
@@ -369,12 +498,14 @@ export const KNOWN_EVENT_KINDS = [
   "files",
   "text_matches",
   "file_status",
+  "todo_state",
   "compacted",
   "session_renamed",
 ] as const;
 
 /** Every request tag the SDK can send. */
 export const KNOWN_REQUEST_KINDS = [
+  "runtime_command",
   "hello",
   "list_sessions",
   "archive_session",
@@ -383,7 +514,11 @@ export const KNOWN_REQUEST_KINDS = [
   "create_session",
   "attach_session",
   "fork_session",
+  "transfer_session",
   "detach_session",
+  "configure_tools",
+  "list_tools",
+  "tool_result",
   "send_message",
   "cancel",
   "soft_interrupt",
@@ -397,19 +532,29 @@ export const KNOWN_REQUEST_KINDS = [
   "set_api_key",
   "clear_api_key",
   "notify_auth_changed",
+  "invalidate_usage",
   "read_file",
   "find_files",
   "search_text",
   "file_status",
+  "get_todo_state",
+  "ack_todo_follow_up",
   "set_model",
   "set_reasoning_effort",
   "compact",
   "rename_session",
+  "set_session_saved",
+  "applet_action",
+  "close_applet",
   "rewind_undo",
   "cancel_soft_interrupts",
+  "background_tool",
   "ping",
 ] as const;
 
 export function isKnownEvent(frame: AnyApiEvent): frame is ApiEvent {
   return (KNOWN_EVENT_KINDS as readonly string[]).includes(frame.ev);
 }
+
+/** Natural completion has no stop reason. Transport loss is not proof of a crash. */
+export type TurnStopReason = "interrupted" | "failure" | "crash" | "provider_guardrail" | "limit_reached" | "unknown";

@@ -6,12 +6,14 @@ pub mod failover;
 pub mod fallback_pick;
 pub mod fingerprint;
 pub mod model_id;
+pub mod model_names;
 pub mod models;
 pub mod openai_schema;
 pub mod pricing;
 pub mod reasoning;
 pub mod retry_after;
 pub mod selection;
+pub mod service_tier;
 pub mod transport;
 
 pub use jcode_usage_types::{ModelUsage, compare_model_usage};
@@ -169,8 +171,30 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Bind this runtime to a saved OAuth account without changing the global login.
+    /// Implementations must preserve the binding through credential refresh and forks.
+    fn set_oauth_account(&self, label: Option<&str>) -> Result<()> {
+        if label.is_some() {
+            anyhow::bail!("This provider does not support named OAuth accounts");
+        }
+        Ok(())
+    }
+
+    /// The explicitly bound OAuth account, independent of the global active login.
+    fn oauth_account_label(&self) -> Option<String> {
+        None
+    }
+
     /// Whether this provider path can safely receive `ContentBlock::Image` inputs.
     fn supports_image_input(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider path natively supports deferred tool definitions
+    /// (`ToolDefinition::defer_loading`) loaded by `ContentBlock::ToolReference`
+    /// without invalidating the prompt cache. Providers that return false must
+    /// tolerate (and drop) deferred definitions and reference blocks.
+    fn supports_deferred_tools(&self) -> bool {
         false
     }
 
@@ -465,31 +489,117 @@ pub trait Provider: Send + Sync {
 
     /// Simple completion that returns text directly (no streaming).
     async fn complete_simple(&self, prompt: &str, system: &str) -> Result<String> {
-        use futures::StreamExt;
+        collect_simple_completion(self, prompt, system)
+            .await
+            .map(|(text, _)| text)
+    }
 
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-                cache_control: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        }];
+    /// Like [`Provider::complete_simple`], but also returns the provider-reported
+    /// token usage so side calls (compaction summaries, memory sidecar) can be
+    /// accounted for.
+    ///
+    /// Internal callers use this method, so a provider that customizes simple
+    /// completion must override this method (and may override `complete_simple`
+    /// to match). The default streams through `complete`.
+    async fn complete_simple_with_usage(
+        &self,
+        prompt: &str,
+        system: &str,
+    ) -> Result<(String, SimpleCompletionUsage)> {
+        collect_simple_completion(self, prompt, system).await
+    }
+}
 
-        let response = self.complete(&messages, &[], system, None).await?;
-        let mut result = String::new();
-        tokio::pin!(response);
+/// Drive `Provider::complete` for a single user prompt and collect the text and
+/// provider-reported usage.
+pub async fn collect_simple_completion<P: Provider + ?Sized>(
+    provider: &P,
+    prompt: &str,
+    system: &str,
+) -> Result<(String, SimpleCompletionUsage)> {
+    use futures::StreamExt;
 
-        while let Some(event) = response.next().await {
-            match event {
-                Ok(StreamEvent::TextDelta(text)) => result.push_str(&text),
-                Ok(_) => {}
-                Err(err) => return Err(err),
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: prompt.to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+
+    let response = provider.complete(&messages, &[], system, None).await?;
+    let mut result = String::new();
+    let mut usage = SimpleCompletionUsage::default();
+    tokio::pin!(response);
+
+    while let Some(event) = response.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(text)) => result.push_str(&text),
+            Ok(StreamEvent::TextSuffixReplace { old_text, new_text }) => {
+                jcode_message_types::replace_text_suffix(&mut result, &old_text, &new_text);
             }
+            Ok(StreamEvent::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            }) => usage.observe(
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            ),
+            Ok(_) => {}
+            Err(err) => return Err(err),
         }
+    }
 
-        Ok(result)
+    Ok((result, usage))
+}
+
+/// Provider-reported usage for a non-agent completion.
+///
+/// Streams may report usage more than once (for example a start event with
+/// input tokens and a final event with output tokens). Each field keeps the
+/// latest value reported, matching how the agent turn loop treats repeated
+/// `TokenUsage` events (they are cumulative snapshots, not deltas).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SimpleCompletionUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+impl SimpleCompletionUsage {
+    pub fn observe(
+        &mut self,
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_creation: Option<u64>,
+    ) {
+        if input.is_some() {
+            self.input_tokens = input;
+        }
+        if output.is_some() {
+            self.output_tokens = output;
+        }
+        if cache_read.is_some() {
+            self.cache_read_input_tokens = cache_read;
+        }
+        if cache_creation.is_some() {
+            self.cache_creation_input_tokens = cache_creation;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
     }
 }
 
@@ -812,6 +922,11 @@ impl RouteSelection {
         }
     }
 
+    /// Exact saved OAuth account encoded in the wire API method, if pinned.
+    pub fn account_label(&self) -> Option<&str> {
+        oauth_account_label(&self.api_method)
+    }
+
     /// The string model spec that applies this route selection, including any
     /// provider routing prefix/suffix (`openai-oauth:`, `claude-api:`,
     /// `openai/gpt-5@OpenAI`, `copilot:`, ...).
@@ -823,6 +938,16 @@ impl RouteSelection {
     /// drift between provider implementations.
     pub fn routed_model_spec(&self) -> String {
         let model = self.model.trim();
+        if let Some(label) = self.account_label() {
+            let prefix = match self.runtime_key {
+                RuntimeKey::ClaudeOAuth => Some("claude-oauth"),
+                RuntimeKey::OpenAIOAuth => Some("openai-oauth"),
+                _ => None,
+            };
+            if let Some(prefix) = prefix {
+                return format!("{prefix}@{label}:{model}");
+            }
+        }
         match &self.runtime_key {
             RuntimeKey::JcodeSubscription => model.to_string(),
             RuntimeKey::ClaudeOAuth => format!("claude-oauth:{model}"),
@@ -860,8 +985,8 @@ impl RouteSelection {
 }
 
 /// Grok Build routing spec: `grok-4.6` and `grok-build:grok-4.6` both become
-/// `grok-build:grok-4.6` so `MultiProvider::set_model` dispatches to the ACP
-/// runtime instead of treating the bare id as the active provider's model.
+/// `grok-build:grok-4.6` so `MultiProvider::set_model` dispatches to the Grok
+/// Build runtime instead of treating the bare id as the active provider's model.
 pub fn grok_build_model_spec(model: &str) -> String {
     let bare = model.strip_prefix("grok-build:").unwrap_or(model).trim();
     format!("grok-build:{bare}")
@@ -905,6 +1030,19 @@ pub enum ModelRouteApiMethod {
     Other(String),
 }
 
+/// Account-qualified OAuth method, preserving the case-sensitive saved label.
+pub fn oauth_account_label(method: &str) -> Option<&str> {
+    let (base, label) = method.trim().split_once('@')?;
+    if !matches!(base, "claude-oauth" | "openai-oauth")
+        || label.is_empty()
+        || label.contains([':', '@'])
+        || label.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(label)
+}
+
 impl ModelRouteApiMethod {
     /// The route-vocabulary api_method for a canonical dual-auth route.
     pub fn from_auth_route(route: crate::auth_mode::AuthRoute) -> Self {
@@ -919,6 +1057,11 @@ impl ModelRouteApiMethod {
 
     pub fn parse(value: &str) -> Self {
         let trimmed = value.trim();
+        let trimmed = if oauth_account_label(trimmed).is_some() {
+            trimmed.split_once('@').unwrap().0
+        } else {
+            trimmed
+        };
         let lower = trimmed.to_ascii_lowercase();
         // Dual-auth (Anthropic/OpenAI OAuth-vs-API) tokens share one canonical
         // alias table so the route vocabulary never drifts from the runtime/CLI
@@ -1117,12 +1260,14 @@ pub fn model_route_metadata_is_recommended(
         return false;
     }
     let api_method = ModelRouteApiMethod::parse(api_method);
+    // Recommendations track the curated quality-first defaults so the picker
+    // highlights the newest flagship automatically when the defaults move.
     match model {
-        "gpt-5.5" => {
+        DEFAULT_OPENAI_MODEL => {
             matches!(&api_method, ModelRouteApiMethod::OpenAIOAuth)
                 && model_route_provider_labels_match(provider, "openai")
         }
-        "claude-opus-4-8" => {
+        DEFAULT_CLAUDE_MODEL => {
             matches!(
                 &api_method,
                 ModelRouteApiMethod::ClaudeOAuth | ModelRouteApiMethod::AnthropicApiKey
@@ -1368,8 +1513,71 @@ fn reference_request_cost_micros(
 }
 
 #[cfg(test)]
+mod saved_account_route_tests {
+    use super::*;
+
+    #[test]
+    fn saved_account_routes_survive_serialization_and_restore_specs() {
+        for (base, runtime, model) in [
+            ("claude-oauth", RuntimeKey::ClaudeOAuth, "claude-sonnet-4-6"),
+            ("openai-oauth", RuntimeKey::OpenAIOAuth, "gpt-5.5"),
+        ] {
+            for label in ["work", "personal", "Named-Account"] {
+                let route = ModelRoute {
+                    model: model.to_string(),
+                    provider: "provider".to_string(),
+                    api_method: format!("{base}@{label}"),
+                    available: true,
+                    detail: String::new(),
+                    cheapness: None,
+                    usage: None,
+                };
+                let selection = RouteSelection::from_model_route(&route);
+                assert_eq!(selection.runtime_key, runtime);
+                assert_eq!(selection.account_label(), Some(label));
+                let json = serde_json::to_string(&selection).unwrap();
+                let restored: RouteSelection = serde_json::from_str(&json).unwrap();
+                assert_eq!(restored, selection);
+                assert_eq!(
+                    restored.routed_model_spec(),
+                    format!("{base}@{label}:{model}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_or_non_oauth_account_methods_are_not_accepted() {
+        for method in [
+            "claude-oauth@",
+            "openai-oauth@work:bad",
+            "openai-oauth@a@b",
+            "openai-api-key@work",
+            "claude-oauth@work\nlabel",
+        ] {
+            assert_eq!(oauth_account_label(method), None, "{method:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_completion_usage_keeps_latest_reported_values() {
+        let mut usage = SimpleCompletionUsage::default();
+        assert!(usage.is_empty());
+        // Start event: input only.
+        usage.observe(Some(1_000), None, Some(700), None);
+        // Final event: output and a refreshed input snapshot.
+        usage.observe(Some(1_050), Some(90), None, Some(12));
+        assert_eq!(usage.input_tokens, Some(1_050));
+        assert_eq!(usage.output_tokens, Some(90));
+        assert_eq!(usage.cache_read_input_tokens, Some(700));
+        assert_eq!(usage.cache_creation_input_tokens, Some(12));
+        assert!(!usage.is_empty());
+    }
 
     #[test]
     fn metered_estimate_computes_reference_cost() {
@@ -1524,52 +1732,55 @@ mod tests {
     #[test]
     fn model_route_recommendation_policy_is_provider_aware() {
         assert!(model_route_metadata_is_recommended(
-            "gpt-5.5",
+            DEFAULT_OPENAI_MODEL,
             "OpenAI",
             "openai-oauth",
             true
         ));
         assert!(!model_route_metadata_is_recommended(
-            "gpt-5.5",
+            DEFAULT_OPENAI_MODEL,
             "OpenAI",
             "openai-api-key",
             true
         ));
         assert!(!model_route_metadata_is_recommended(
-            "gpt-5.5", "Copilot", "copilot", true
+            DEFAULT_OPENAI_MODEL,
+            "Copilot",
+            "copilot",
+            true
         ));
         assert!(!model_route_metadata_is_recommended(
-            "gpt-5.5",
+            DEFAULT_OPENAI_MODEL,
             "OpenAI",
             "openai-oauth",
             false
         ));
         assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
+            DEFAULT_CLAUDE_MODEL,
             "Anthropic",
             "claude-oauth",
             true
         ));
         assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
+            DEFAULT_CLAUDE_MODEL,
             "Anthropic",
             "claude-api",
             true
         ));
         assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
+            DEFAULT_CLAUDE_MODEL,
             "Anthropic",
             "claude-oauth",
             true
         ));
         assert!(model_route_metadata_is_recommended(
-            "claude-opus-4-8",
+            DEFAULT_CLAUDE_MODEL,
             "Anthropic",
             "claude-api",
             true
         ));
         assert!(!model_route_metadata_is_recommended(
-            "claude-opus-4-8",
+            DEFAULT_CLAUDE_MODEL,
             "Anthropic",
             "openrouter",
             true

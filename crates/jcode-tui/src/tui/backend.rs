@@ -285,8 +285,8 @@ fn remote_protocol_frame_exceeds_limit(buffered: usize, incoming: usize) -> bool
 
 pub(crate) trait RemoteEventState {
     fn handle_tool_start(&mut self, id: &str, name: &str);
-    fn handle_tool_input(&mut self, delta: &str);
-    fn get_current_tool_input(&self) -> serde_json::Value;
+    fn handle_tool_input(&mut self, id: Option<&str>, delta: &str);
+    fn get_tool_input(&self, id: &str) -> serde_json::Value;
     fn handle_tool_exec(&mut self, id: &str, name: &str);
     fn handle_tool_done(&mut self, id: &str, name: &str, output: &str) -> String;
     fn clear_pending(&mut self);
@@ -355,6 +355,7 @@ impl RemoteConnection {
             })
             .map(|session_id| session_id.to_string());
         conn.send_request(Request::Subscribe {
+            system_prompt: None,
             supports_pdf_panels: false,
             id: conn.next_request_id,
             working_dir,
@@ -446,7 +447,7 @@ impl RemoteConnection {
                 content.len(),
                 content.chars().count()
             )),
-            Request::CancelSoftInterrupts { id } => Some(base("cancel_soft_interrupts", *id)),
+            Request::CancelSoftInterrupts { id, .. } => Some(base("cancel_soft_interrupts", *id)),
             Request::BackgroundTool { id } => Some(base("background_tool", *id)),
             _ => None,
         }
@@ -636,6 +637,27 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Refresh daemon usage after a client-side banked reset attempt.
+    pub async fn invalidate_openai_usage(&mut self, account_label: Option<String>) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::InvalidateOpenAiUsage { id, account_label })
+            .await?;
+        Ok(id)
+    }
+
+    /// Refresh daemon usage and Claude cooldowns after a session-limit reset attempt.
+    pub async fn invalidate_anthropic_usage(
+        &mut self,
+        account_label: Option<String>,
+    ) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::InvalidateAnthropicUsage { id, account_label })
+            .await?;
+        Ok(id)
+    }
+
     /// Re-request the session history payload from the server.
     ///
     /// Used by the client-side history-recovery watchdog: if the bootstrap
@@ -766,9 +788,29 @@ impl RemoteConnection {
         selection: crate::provider::RouteSelection,
     ) -> Result<u64> {
         let id = self.next_request_id;
-        let request = Request::SetRoute { id, selection };
+        let request = Request::SetRoute {
+            id,
+            selection,
+            automatic_failover: false,
+        };
         self.next_request_id += 1;
         self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Apply an automatic target only if the daemon still approves its pool membership.
+    pub async fn set_route_selection_for_failover(
+        &mut self,
+        selection: crate::provider::RouteSelection,
+    ) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::SetRoute {
+            id,
+            selection,
+            automatic_failover: true,
+        })
+        .await?;
         Ok(id)
     }
 
@@ -780,6 +822,26 @@ impl RemoteConnection {
         };
         self.next_request_id += 1;
         self.send_request(request).await
+    }
+
+    /// Set a worker model on the server, for this session or (with `global`)
+    /// as the server's own default.
+    pub async fn set_agent_model(
+        &mut self,
+        target: String,
+        model: Option<String>,
+        global: bool,
+    ) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::SetAgentModel {
+            id,
+            target,
+            model,
+            global,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
     }
 
     /// Launch a subagent immediately on the active remote session.
@@ -864,6 +926,16 @@ impl RemoteConnection {
     }
 
     /// Set or clear the custom session display title on the server.
+    pub async fn set_session_saved(&mut self, saved: bool, label: Option<String>) -> Result<()> {
+        let request = Request::SetSessionSaved {
+            id: self.next_request_id,
+            saved,
+            label,
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await
+    }
+
     pub async fn rename_session(&mut self, title: Option<String>) -> Result<()> {
         let request = Request::RenameSession {
             id: self.next_request_id,
@@ -948,6 +1020,7 @@ impl RemoteConnection {
             content,
             images,
             urgent,
+            client_id: None,
         };
         self.next_request_id += 1;
         self.send_request_with_interrupt_trigger(request, Some("soft_interrupt"))
@@ -958,6 +1031,7 @@ impl RemoteConnection {
     pub async fn cancel_soft_interrupts(&mut self) -> Result<()> {
         let request = Request::CancelSoftInterrupts {
             id: self.next_request_id,
+            client_ids: None,
         };
         self.next_request_id += 1;
         self.send_request_with_interrupt_trigger(request, Some("cancel_soft_interrupts"))
@@ -1376,13 +1450,13 @@ impl RemoteConnection {
     }
 
     /// Handle tool input delta
-    pub fn handle_tool_input(&mut self, delta: &str) {
-        self.tool_diff.handle_tool_input(delta);
+    pub fn handle_tool_input(&mut self, id: Option<&str>, delta: &str) {
+        self.tool_diff.handle_tool_input(id, delta);
     }
 
-    /// Get parsed current tool input (before it's cleared in handle_tool_exec)
-    pub fn get_current_tool_input(&self) -> serde_json::Value {
-        self.tool_diff.current_tool_input_json()
+    /// Get parsed input for this call (before handle_tool_exec clears it)
+    pub fn get_tool_input(&self, id: &str) -> serde_json::Value {
+        self.tool_diff.tool_input_json(id)
     }
 
     /// Handle tool exec - cache file content if edit/write
@@ -1416,12 +1490,12 @@ impl RemoteEventState for RemoteConnection {
         Self::handle_tool_start(self, id, name);
     }
 
-    fn handle_tool_input(&mut self, delta: &str) {
-        Self::handle_tool_input(self, delta);
+    fn handle_tool_input(&mut self, id: Option<&str>, delta: &str) {
+        Self::handle_tool_input(self, id, delta);
     }
 
-    fn get_current_tool_input(&self) -> serde_json::Value {
-        Self::get_current_tool_input(self)
+    fn get_tool_input(&self, id: &str) -> serde_json::Value {
+        Self::get_tool_input(self, id)
     }
 
     fn handle_tool_exec(&mut self, id: &str, name: &str) {
@@ -1462,12 +1536,12 @@ impl RemoteEventState for ReplayRemoteState {
         self.tool_diff.handle_tool_start(id, name);
     }
 
-    fn handle_tool_input(&mut self, delta: &str) {
-        self.tool_diff.handle_tool_input(delta);
+    fn handle_tool_input(&mut self, id: Option<&str>, delta: &str) {
+        self.tool_diff.handle_tool_input(id, delta);
     }
 
-    fn get_current_tool_input(&self) -> serde_json::Value {
-        self.tool_diff.current_tool_input_json()
+    fn get_tool_input(&self, id: &str) -> serde_json::Value {
+        self.tool_diff.tool_input_json(id)
     }
 
     fn handle_tool_exec(&mut self, id: &str, name: &str) {
@@ -1503,6 +1577,36 @@ impl RemoteEventState for ReplayRemoteState {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn route_selection_wire_marks_only_automatic_failover() {
+        let mut remote = RemoteConnection::dummy();
+        let peer = remote.take_dummy_peer().unwrap();
+        let (reader, _writer) = peer.into_split();
+        let mut reader = BufReader::new(reader);
+        let selection = crate::provider::RouteSelection {
+            model: "gpt-test".into(),
+            runtime_key: jcode_provider_core::RuntimeKey::OpenAIOAuth,
+            api_method: "openai-oauth@openai-fox".into(),
+            provider_label: "OpenAI".into(),
+            detail: String::new(),
+        };
+        remote.set_route_selection(selection.clone()).await.unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let manual: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(manual["type"], "set_route");
+        assert!(manual.get("automatic_failover").is_none());
+        remote
+            .set_route_selection_for_failover(selection)
+            .await
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let automatic: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(automatic["type"], "set_route");
+        assert_eq!(automatic["automatic_failover"], true);
+    }
 
     #[tokio::test]
     async fn detached_auth_changed_notification_does_not_wait_for_writer_lock() {

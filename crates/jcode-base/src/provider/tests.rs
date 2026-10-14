@@ -1,4 +1,5 @@
 use super::*;
+mod saved_account_selection;
 use crate::provider::models::{ensure_model_allowed_for_subscription, filtered_display_models};
 
 fn with_clean_provider_test_env<T>(f: impl FnOnce() -> T) -> T {
@@ -34,10 +35,12 @@ fn with_clean_provider_test_env<T>(f: impl FnOnce() -> T) -> T {
         "OPENAI_COMPAT_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
         "JCODE_RUNTIME_PROVIDER",
         "JCODE_ACTIVE_PROVIDER",
         "JCODE_INITIAL_PROVIDER_EXPLICIT",
         "JCODE_OPENAI_MODEL",
+        "JCODE_SAME_PROVIDER_ACCOUNT_FAILOVER",
         "JCODE_NAMED_PROVIDER_PROFILE",
         "JCODE_PROVIDER_PROFILE_ACTIVE",
         "JCODE_PROVIDER_PROFILE_NAME",
@@ -168,6 +171,7 @@ fn save_test_openrouter_model_cache(namespace: &str, source_api_base: &str, mode
                 context_length: None,
                 pricing: jcode_provider_openrouter::ModelPricing::default(),
                 created: None,
+                ..Default::default()
             })
             .collect(),
     };
@@ -208,7 +212,6 @@ fn test_multi_provider_with_openai() -> MultiProvider {
     save_test_openai_oauth_credentials();
     crate::env::set_var("OPENAI_API_KEY", "sk-test-openai-api-key");
     MultiProvider {
-        claude: RwLock::new(None),
         anthropic: RwLock::new(None),
         openai: RwLock::new(Some(test_openai_runtime() as Arc<dyn Provider>)),
         copilot_api: RwLock::new(None),
@@ -220,7 +223,6 @@ fn test_multi_provider_with_openai() -> MultiProvider {
         openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
         active_openai_compatible_profile: RwLock::new(None),
         active: RwLock::new(ActiveProvider::OpenAI),
-        use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),
         initial_provider: None,
         routes_memo: std::sync::Mutex::new(None),
@@ -436,8 +438,15 @@ fn openai_model_routes_cover_oauth_api_and_no_auth_state_space() {
             .filter(|route| route.provider == "OpenAI" && route.model == model)
             .map(|route| (route.api_method.as_str(), route.available))
             .collect::<Vec<_>>();
+        let account_label =
+            crate::auth::codex::active_account_label().expect("saved OpenAI account");
         assert!(
-            methods.contains(&("openai-oauth", true)),
+            methods.iter().any(|(method, available)| {
+                ModelRouteApiMethod::parse(method) == ModelRouteApiMethod::OpenAIOAuth
+                    && jcode_provider_core::oauth_account_label(method)
+                        == Some(account_label.as_str())
+                    && *available
+            }),
             "routes: {methods:?}"
         );
         assert!(
@@ -460,7 +469,15 @@ fn openai_model_routes_cover_oauth_api_and_no_auth_state_space() {
             .filter(|route| route.provider == "OpenAI" && route.model == model)
             .map(|route| route.api_method.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(oauth_only_methods, vec!["openai-oauth"]);
+        assert_eq!(oauth_only_methods.len(), 1);
+        assert_eq!(
+            ModelRouteApiMethod::parse(oauth_only_methods[0]),
+            ModelRouteApiMethod::OpenAIOAuth
+        );
+        assert_eq!(
+            jcode_provider_core::oauth_account_label(oauth_only_methods[0]),
+            Some(account_label.as_str())
+        );
 
         crate::env::set_var("OPENAI_API_KEY", "sk-test-openai-api-key");
         std::fs::remove_file(
@@ -799,6 +816,7 @@ struct StubExternalRuntime {
     models: &'static [&'static str],
     model: std::sync::RwLock<String>,
     credential_mode: std::sync::RwLock<jcode_provider_core::CredentialMode>,
+    oauth_account: std::sync::RwLock<Option<String>>,
 }
 
 impl StubExternalRuntime {
@@ -815,6 +833,7 @@ impl StubExternalRuntime {
             models,
             model: std::sync::RwLock::new(models[0].to_string()),
             credential_mode: std::sync::RwLock::new(jcode_provider_core::CredentialMode::Auto),
+            oauth_account: std::sync::RwLock::new(None),
         }
     }
 
@@ -940,6 +959,15 @@ impl Provider for StubExternalRuntime {
             self.models,
         ))
     }
+
+    fn set_oauth_account(&self, label: Option<&str>) -> anyhow::Result<()> {
+        *self.oauth_account.write().unwrap() = label.map(str::to_owned);
+        Ok(())
+    }
+
+    fn oauth_account_label(&self) -> Option<String> {
+        self.oauth_account.read().unwrap().clone()
+    }
 }
 
 fn test_cursor_runtime() -> Arc<dyn Provider> {
@@ -1011,7 +1039,6 @@ fn test_openrouter_runtime() -> anyhow::Result<Arc<dyn Provider>> {
 
 fn test_multi_provider_with_cursor() -> MultiProvider {
     MultiProvider {
-        claude: RwLock::new(None),
         anthropic: RwLock::new(None),
         openai: RwLock::new(None),
         copilot_api: RwLock::new(None),
@@ -1023,12 +1050,73 @@ fn test_multi_provider_with_cursor() -> MultiProvider {
         openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
         active_openai_compatible_profile: RwLock::new(None),
         active: RwLock::new(ActiveProvider::Cursor),
-        use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),
         initial_provider: None,
         routes_memo: std::sync::Mutex::new(None),
         post_auth_refreshes_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
+}
+
+struct NativeBridgeProvider {
+    tx: NativeToolResultSender,
+}
+
+#[async_trait::async_trait]
+impl Provider for NativeBridgeProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> anyhow::Result<EventStream> {
+        anyhow::bail!("native bridge provider must not complete")
+    }
+
+    fn name(&self) -> &'static str {
+        "cursor"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            tx: self.tx.clone(),
+        })
+    }
+
+    fn native_result_sender(&self) -> Option<NativeToolResultSender> {
+        Some(self.tx.clone())
+    }
+}
+
+/// Regression: Cursor's AgentService only resumes a turn after the MCP tool
+/// result is written back onto its stream. The agent loop reaches the runtime
+/// through `MultiProvider`, so a `None` here silently dropped every result and
+/// hung Cursor turns right after the local tool finished.
+#[test]
+fn cursor_native_result_sender_reaches_the_active_cursor_runtime() {
+    let runtime = enter_test_runtime();
+    runtime.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let provider = test_multi_provider_with_cursor();
+        *provider
+            .cursor
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(NativeBridgeProvider { tx }));
+
+        let sender = provider
+            .native_result_sender()
+            .expect("Cursor must expose its native tool result bridge");
+        sender
+            .send(NativeToolResult::success(
+                "stream:1:exec".to_string(),
+                "ok".to_string(),
+            ))
+            .await
+            .expect("send native result");
+        let received = rx.recv().await.expect("runtime receives the result");
+        assert_eq!(received.request_id, "stream:1:exec");
+    });
 }
 
 struct PrewarmRecordingProvider {
@@ -1144,6 +1232,7 @@ include!("tests/auth_refresh.rs");
 include!("tests/model_resolution.rs");
 include!("tests/issue_534_profile_preservation.rs");
 include!("tests/fallback_failover.rs");
+include!("tests/account_failover.rs");
 include!("tests/catalog_subscription.rs");
 
 /// Rendering the route catalog must never schedule network work.
@@ -1203,5 +1292,74 @@ fn profile_catalog_cache_needs_refresh_for_missing_cache() {
             super::catalog_scheduler::profile_catalog_cache_needs_refresh(profile),
             "a missing catalog cache must be reported as needing a refresh"
         );
+    });
+}
+
+#[test]
+fn jcode_subscription_model_prefix_parses_explicit_specs() {
+    assert_eq!(
+        super::jcode_subscription_model_prefix("jcode:gpt-5.5"),
+        Some("gpt-5.5")
+    );
+    assert_eq!(
+        super::jcode_subscription_model_prefix("jcode-subscription: gpt-5.5 "),
+        Some("gpt-5.5")
+    );
+    assert_eq!(super::jcode_subscription_model_prefix("jcode:"), None);
+    assert_eq!(super::jcode_subscription_model_prefix("gpt-5.5"), None);
+    assert_eq!(
+        super::jcode_subscription_model_prefix("openai:gpt-5.5"),
+        None
+    );
+}
+
+/// A session persisted on one credential (e.g. `claude-api:`) must not stay
+/// pinned to it after the deployment moved to the other credential. The
+/// runtime pin wins; with no pin, the bare provider prefix lets auto mode pick.
+#[test]
+fn stale_credential_route_fallback_follows_runtime_pin_or_drops_to_auto() {
+    with_clean_provider_test_env(|| {
+        // Runtime pinned to Claude OAuth, session persisted on the API key.
+        crate::env::set_var("JCODE_RUNTIME_PROVIDER", "claude");
+        let (request, healed) = stale_credential_route_fallback("claude-api:claude-sonnet-5")
+            .expect("stale API-key pin must fall back to the runtime's OAuth route");
+        assert_eq!(request, "claude-oauth:claude-sonnet-5");
+        assert_eq!(healed.provider_key.as_deref(), Some("claude-oauth"));
+        assert_eq!(healed.route_api_method.as_deref(), Some("claude-oauth"));
+        assert_eq!(healed.stale_request, "claude-api:claude-sonnet-5");
+
+        // The reverse move: runtime on the API key, session persisted on OAuth.
+        crate::env::set_var("JCODE_RUNTIME_PROVIDER", "claude-api");
+        let (request, healed) = stale_credential_route_fallback("claude-oauth:claude-sonnet-5")
+            .expect("stale OAuth pin must fall back to the runtime's API-key route");
+        assert_eq!(request, "claude-api:claude-sonnet-5");
+        assert_eq!(healed.provider_key.as_deref(), Some("claude-api"));
+        assert_eq!(
+            healed.route_api_method.as_deref(),
+            Some("anthropic-api-key")
+        );
+
+        // The runtime pins the very credential that failed: that is a real
+        // auth failure, not a stale session, so there is nothing to fall back to.
+        assert!(stale_credential_route_fallback("claude-api:claude-sonnet-5").is_none());
+
+        // A runtime pin for the *other* provider says nothing about this one:
+        // drop to auto mode.
+        crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-api");
+        let (request, healed) = stale_credential_route_fallback("claude-api:claude-sonnet-5")
+            .expect("unpinned provider falls back to auto mode");
+        assert_eq!(request, "claude:claude-sonnet-5");
+        assert_eq!(healed.provider_key.as_deref(), Some("claude"));
+        assert_eq!(healed.route_api_method, None);
+
+        crate::env::remove_var("JCODE_RUNTIME_PROVIDER");
+        let (request, _) = stale_credential_route_fallback("openai-oauth:gpt-5.5")
+            .expect("no runtime pin falls back to auto mode");
+        assert_eq!(request, "openai:gpt-5.5");
+
+        // Requests that pin no credential have nothing to recover.
+        assert!(stale_credential_route_fallback("claude:claude-sonnet-5").is_none());
+        assert!(stale_credential_route_fallback("claude-sonnet-5").is_none());
+        assert!(stale_credential_route_fallback("openrouter:z-ai/glm-5.2@Novita").is_none());
     });
 }

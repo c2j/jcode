@@ -13,7 +13,10 @@
 //! This keeps the daemon untouched while the API surface stabilizes. Once
 //! proven, the same translation can move in-process behind a `hello` sniff on
 //! the main socket.
+// Tests hold the std env/home serialization lock across awaits on purpose.
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+pub mod allocator;
 pub mod background_progress;
 pub mod translate;
 
@@ -34,6 +37,55 @@ use jcode_transport::{Listener, Stream};
 // resolve different directories (they once did, and the desktop app could not
 // connect as a result).
 pub use jcode_harness_api::{api_socket_path, legacy_socket_path};
+
+/// Frames above this size are transient (history, transcripts, file reads).
+/// Their buffers are released instead of pinning that capacity for the rest
+/// of the connection, and the allocator is asked to return the pages.
+const LARGE_FRAME_BYTES: usize = 256 * 1024;
+
+fn release_large_frame(buffer: &mut Vec<u8>) {
+    if buffer.capacity() > LARGE_FRAME_BYTES {
+        *buffer = Vec::new();
+        allocator::trim();
+    }
+}
+
+/// Capabilities the native daemon advertises in its ping reply. Empty when
+/// the daemon is too old to advertise any or did not answer in time.
+///
+/// Probe only an old, universally supported control request on a disposable
+/// connection. Older daemons close that connection after ping, and may close
+/// connections receiving unknown requests. Never probe on the session stream.
+async fn daemon_capabilities(socket: &std::path::Path) -> Vec<String> {
+    let probe = async {
+        let mut stream = Stream::connect(socket).await.ok()?;
+        write_json_line(&mut stream, &serde_json::json!({"type":"ping", "id":0}))
+            .await
+            .ok()?;
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        read_frame(&mut reader, &mut line).await.ok()?;
+        let reply: Value = serde_json::from_str(&line).ok()?;
+        if reply["type"] != "pong" || reply["id"] != 0 {
+            return None;
+        }
+        Some(
+            reply["capabilities"]
+                .as_array()
+                .map(|caps| {
+                    caps.iter()
+                        .filter_map(|cap| cap.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    };
+    tokio::time::timeout(std::time::Duration::from_millis(500), probe)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
 
 /// Largest single request frame accepted from an API client, in bytes.
 ///
@@ -191,6 +243,8 @@ pub async fn run_bridge(api_socket: PathBuf, legacy_socket: PathBuf) -> Result<(
             if let Err(error) = handle_api_client(stream, legacy).await {
                 eprintln!("harness API bridge: client ended: {error:#}");
             }
+            // A closed client drops its translation state and buffers.
+            allocator::trim();
         });
     }
 }
@@ -273,6 +327,10 @@ where
     let legacy = Stream::connect(&legacy_socket)
         .await
         .with_context(|| format!("connect legacy socket {}", legacy_socket.display()))?;
+    let daemon_caps = daemon_capabilities(&legacy_socket).await;
+    let runtime_commands_supported = daemon_caps.iter().any(|cap| cap == "runtime_commands");
+    let session_tools_supported = daemon_caps.iter().any(|cap| cap == "session_tools");
+    let soft_interrupt_ids_supported = daemon_caps.iter().any(|cap| cap == "soft_interrupt_ids");
     let hello_ok = ServerFrame::reply(
         reply_to,
         ApiEvent::HelloOk {
@@ -282,18 +340,29 @@ where
                 "sessions",
                 "streaming",
                 "text_framing",
+                "turn_stop_reasons",
                 "side_panel",
                 "persisted_session_discovery",
                 "runtime_info",
                 "api_key_provisioning",
                 "auth_changed_notification",
+                "usage_invalidation",
                 "session_archive",
                 "session_retention",
                 "session_files",
                 "session_fork",
+                "todo_state",
             ]
             .into_iter()
             .map(str::to_string)
+            .chain(runtime_commands_supported.then(|| "runtime_commands".to_string()))
+            .chain(session_tools_supported.then(|| "session_tools".to_string()))
+            .chain(
+                ["soft_interrupt_ids", "background_tool_result"]
+                    .into_iter()
+                    .filter(|_| soft_interrupt_ids_supported)
+                    .map(str::to_string),
+            )
             .collect(),
         },
     );
@@ -305,6 +374,9 @@ where
 
     let mut state =
         translate::BridgeState::with_crash_on_disconnect(client_name.starts_with("jcode-desktop-"));
+    state.session_tools_supported = session_tools_supported;
+    state.runtime_commands_supported = runtime_commands_supported;
+    state.soft_interrupt_ids_supported = soft_interrupt_ids_supported;
 
     // 3. Pump both directions in one select loop so translation state stays
     //    single-threaded.
@@ -337,6 +409,7 @@ where
                 }
                 let parsed = serde_json::from_slice(&api_frame);
                 api_frame.clear();
+                release_large_frame(&mut api_frame);
                 let request: Value = match parsed {
                     Ok(value) => value,
                     Err(error) => {
@@ -356,6 +429,8 @@ where
                 let outbound = tokio::task::block_in_place(|| {
                     state.api_request_to_legacy(&request)
                 });
+                let heavy = allocator::request_is_heavy(&request);
+                drop(request);
                 for out in outbound {
                     match out {
                         translate::Outbound::Legacy(value) => {
@@ -365,6 +440,9 @@ where
                             write_json_line(&mut write_half, &frame).await?;
                         }
                     }
+                }
+                if heavy {
+                    allocator::trim();
                 }
             }
             n = read_frame_bytes(&mut legacy_reader, &mut legacy_frame) => {
@@ -381,16 +459,31 @@ where
                     continue;
                 }
                 let parsed = serde_json::from_slice(&legacy_frame);
+                let large = legacy_frame.capacity() > LARGE_FRAME_BYTES;
                 legacy_frame.clear();
                 let event: Value = match parsed {
                     Ok(value) => value,
-                    Err(_) => continue,
+                    Err(_) => {
+                        release_large_frame(&mut legacy_frame);
+                        continue;
+                    }
                 };
-                let frames = tokio::task::block_in_place(|| {
+                // Only a few replies read persisted session files. Streaming
+                // deltas are pure translation, and routing each one through
+                // block_in_place handed the worker core to a fresh blocking
+                // thread per event: a busy session grew the bridge to 69 idle
+                // threads, each pinning its own allocator arena.
+                let frames = if translate::legacy_event_may_block(&event) {
+                    tokio::task::block_in_place(|| state.legacy_event_to_api(&event))
+                } else {
                     state.legacy_event_to_api(&event)
-                });
+                };
+                drop(event);
                 for frame in frames {
                     write_json_line(&mut write_half, &frame).await?;
+                }
+                if large {
+                    release_large_frame(&mut legacy_frame);
                 }
             }
         }

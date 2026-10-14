@@ -33,10 +33,16 @@ const PEEK_LIMIT: u64 = 12;
 /// `peek_session` and `list_sessions` are deliberately absent: they are served
 /// from stored records precisely so a client can look around before attaching.
 const REQUIRES_ATTACH: &[&str] = &[
+    "runtime_command",
+    "detach_session",
+    "configure_tools",
+    "list_tools",
+    "tool_result",
     "send_message",
     "cancel",
     "soft_interrupt",
     "cancel_soft_interrupts",
+    "background_tool",
     "clear",
     "rewind",
     "rewind_undo",
@@ -46,8 +52,10 @@ const REQUIRES_ATTACH: &[&str] = &[
     "set_reasoning_effort",
     "compact",
     "rename_session",
+    "set_session_saved",
     "get_runtime_info",
     "fork_session",
+    "transfer_session",
     "read_file",
     "find_files",
     "search_text",
@@ -84,6 +92,8 @@ use serde_json::{Value, json};
 
 /// Where a translated client request should go.
 #[derive(Debug)]
+// Short-lived per-request value; boxing ServerFrame would touch every reply site.
+#[allow(clippy::large_enum_variant)]
 pub enum Outbound {
     /// Forward to the legacy daemon connection.
     Legacy(Value),
@@ -104,6 +114,14 @@ static NEXT_TEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Per-connection translation state.
 #[derive(Debug, Default)]
 pub struct BridgeState {
+    pub runtime_commands_supported: bool,
+    /// Set only after a safe legacy ping capability probe succeeds.
+    pub session_tools_supported: bool,
+    /// The daemon accepts soft interrupt ids and per-id cancellation, and
+    /// replies to `background_tool` with a result.
+    pub soft_interrupt_ids_supported: bool,
+    /// Leftover queue size reported just before the current turn's `done`.
+    pending_soft_interrupts_at_done: Option<u32>,
     /// Whether an unannounced transport loss should crash the attached session.
     pub crash_on_disconnect: bool,
     /// Session id assigned by the daemon for this connection.
@@ -119,6 +137,8 @@ pub struct BridgeState {
     text_response_ended: bool,
     /// A turn can belong to another attachment or a server-initiated wake.
     observed_turn_active: bool,
+    /// Deduplicate specific limit/cancel notices from the subsequent failure.
+    turn_stop_reported: bool,
     activity_version: u64,
     pending_activity_snapshots: std::collections::HashMap<u64, u64>,
     /// Control requests also emit done, sometimes after their richer reply.
@@ -157,6 +177,10 @@ pub struct BridgeState {
     known_sessions: Vec<String>,
     /// Working directory per session, as far as it is known.
     session_dirs: std::collections::BTreeMap<String, String>,
+    /// Directory sent with an in-flight `create_session` subscribe. A fresh
+    /// session has no persisted metadata until its first prompt, so the
+    /// attach reply falls back to this instead of reporting no directory.
+    pending_create_dir: Option<String>,
     /// Models the daemon last reported for this session.
     ///
     /// The daemon volunteers the catalog on attach and again whenever it
@@ -170,6 +194,8 @@ pub struct BridgeState {
     /// a picker can mark the active entry.
     current_model: Option<String>,
     current_provider: Option<String>,
+    /// Credential the daemon resolved for the session (`oauth`/`api_key`).
+    current_credential: Option<String>,
     /// Reasoning effort last reported by the daemon, so identity events can
     /// carry it without a round trip.
     current_effort: Option<String>,
@@ -210,6 +236,8 @@ struct PersistedSessionMetadata {
     todo_title: Option<String>,
     #[serde(default)]
     saved: bool,
+    #[serde(default)]
+    save_label: Option<String>,
     #[serde(skip)]
     updated_at_ms: Option<i64>,
     #[serde(skip)]
@@ -221,8 +249,16 @@ impl PersistedSessionMetadata {
         self.custom_title
             .as_deref()
             .and_then(Self::normalized_title)
+            // Bookmarks labelled before labels doubled as titles.
+            .or_else(|| self.save_label())
             .or_else(|| self.todo_title.as_deref().and_then(Self::normalized_title))
             .or_else(|| self.title.as_deref().and_then(Self::normalized_title))
+    }
+
+    fn save_label(&self) -> Option<String> {
+        self.saved
+            .then(|| self.save_label.as_deref().and_then(Self::normalized_title))
+            .flatten()
     }
 
     fn normalized_title(title: &str) -> Option<String> {
@@ -239,6 +275,7 @@ struct RecentSessionIndexEntry {
     custom_title: Option<String>,
     todo_title: Option<String>,
     saved: bool,
+    save_label: Option<String>,
     updated_at_ms: i64,
     last_active_at_ms: Option<i64>,
 }
@@ -251,6 +288,7 @@ impl From<&RecentSessionIndexEntry> for PersistedSessionMetadata {
             custom_title: entry.custom_title.clone(),
             todo_title: entry.todo_title.clone(),
             saved: entry.saved,
+            save_label: entry.save_label.clone(),
             updated_at_ms: Some(entry.updated_at_ms),
             last_active_at_ms: entry.last_active_at_ms,
         }
@@ -259,6 +297,10 @@ impl From<&RecentSessionIndexEntry> for PersistedSessionMetadata {
 
 #[derive(Debug, Clone, PartialEq)]
 enum SimpleKind {
+    RuntimeCommand,
+    Detach,
+    Tools,
+    ToolControl,
     Ping,
     History,
     Ok,
@@ -271,10 +313,26 @@ enum SimpleKind {
     /// Awaiting the catalog reply that answers `list_models`.
     Models,
     RuntimeInfo,
+    /// Awaiting `background_tool_result`.
+    BackgroundTool,
+    /// Awaiting `soft_interrupts_cancelled`.
+    SoftInterruptCancel,
     Credential {
         provider: String,
         configured: bool,
     },
+}
+
+/// Whether translating this daemon event may perform synchronous file I/O.
+///
+/// Keep in sync with the arms of [`BridgeState::legacy_event_to_api`] that
+/// read persisted session records or side-panel files. Everything else is
+/// pure in-memory translation and must not pay for `block_in_place`.
+pub fn legacy_event_may_block(event: &Value) -> bool {
+    matches!(
+        event["type"].as_str(),
+        Some("state" | "side_panel_state" | "split_response" | "history")
+    )
 }
 
 impl BridgeState {
@@ -296,7 +354,16 @@ impl BridgeState {
             if let Outbound::Legacy(value) = action
                 && matches!(
                     value["type"].as_str(),
-                    Some("subscribe" | "clear" | "prepare_disconnect" | "notify_auth_changed")
+                    Some(
+                        "subscribe"
+                            | "clear"
+                            | "prepare_disconnect"
+                            | "notify_auth_changed"
+                            | "applet_action"
+                            | "close_applet"
+                            | "invalidate_openai_usage"
+                            | "invalidate_anthropic_usage"
+                    )
                 )
                 && let Some(id) = value["id"].as_u64()
             {
@@ -362,6 +429,98 @@ impl BridgeState {
                     ),
                 },
             ))];
+        }
+
+        if req == "runtime_command" {
+            if !self.runtime_commands_supported {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::InvalidRequest,
+                    "This daemon does not support runtime commands. Update and restart the daemon.",
+                );
+            }
+            let parsed = serde_json::from_value::<jcode_harness_api::ApiRequest>(request.clone());
+            let Ok(jcode_harness_api::ApiRequest::RuntimeCommand {
+                command,
+                args,
+                session_id,
+            }) = parsed
+            else {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::InvalidRequest,
+                    "Invalid runtime command request",
+                );
+            };
+            if session_id.is_empty() {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::InvalidRequest,
+                    "session_id must not be empty",
+                );
+            }
+            let id = self.legacy_id();
+            self.pending_simple
+                .push((id, api_id, SimpleKind::RuntimeCommand));
+            return vec![Outbound::Legacy(
+                json!({"type": "runtime_command", "id": id, "command": command, "args": args}),
+            )];
+        }
+        if matches!(req, "configure_tools" | "list_tools" | "tool_result") {
+            // Validate the typed surface even though this bridge accepts raw JSON.
+            // Never coerce a malformed result/configuration into a valid mutation.
+            if let Err(error) =
+                serde_json::from_value::<jcode_harness_api::ApiRequest>(request.clone())
+            {
+                return Self::error_reply(api_id, ErrorCode::InvalidRequest, &error.to_string());
+            }
+            if request["session_id"].as_str().is_none_or(str::is_empty) {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::InvalidRequest,
+                    "session_id must not be empty",
+                );
+            }
+            if let Some((_, _, Some(target))) = &self.pending_attach_id
+                && self.session_id.is_none()
+                && request["session_id"].as_str() != Some(target.as_str())
+            {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::UnknownSession,
+                    "request does not match the pending attachment",
+                );
+            }
+            if !self.session_tools_supported {
+                return Self::error_reply(
+                    api_id,
+                    ErrorCode::UnknownRequest,
+                    "daemon does not advertise the session_tools capability",
+                );
+            }
+            let id = self.legacy_id();
+            let mut legacy = json!({"type": req, "id": id});
+            match req {
+                "configure_tools" => legacy["tools"] = request["tools"].clone(),
+                "tool_result" => {
+                    legacy["call_id"] = request["call_id"].clone();
+                    legacy["output"] = request["output"].clone();
+                    if let Some(error) = request.get("error") {
+                        legacy["error"] = error.clone();
+                    }
+                }
+                _ => {}
+            }
+            self.pending_simple.push((
+                id,
+                api_id,
+                if req == "list_tools" {
+                    SimpleKind::Tools
+                } else {
+                    SimpleKind::ToolControl
+                },
+            ));
+            return vec![Outbound::Legacy(legacy)];
         }
 
         match req {
@@ -434,6 +593,7 @@ impl BridgeState {
                 self.pending_attach_id = Some((state_id, api_id, requested_session));
                 self.pending_attach_subscribe_id = Some(id);
                 self.pending_model_probe = Some(catalog_id);
+                self.pending_create_dir = None;
                 let mut subscribe = json!({
                     "type": "subscribe",
                     "id": id,
@@ -448,6 +608,9 @@ impl BridgeState {
                 // the repo without saying so gets an agent that cannot build
                 // the very app it is running in.
                 if req == "create_session" {
+                    if let Some(prompt) = request["system_prompt"].as_str() {
+                        subscribe["system_prompt"] = json!(prompt);
+                    }
                     let working_dir =
                         request["working_dir"]
                             .as_str()
@@ -458,6 +621,7 @@ impl BridgeState {
                                     .map(|d| d.display().to_string())
                             });
                     subscribe["working_dir"] = json!(working_dir);
+                    self.pending_create_dir = working_dir.clone();
                     if working_dir
                         .as_deref()
                         .is_some_and(Self::path_is_inside_jcode_repo)
@@ -514,6 +678,11 @@ impl BridgeState {
                 self.pending_fork_id = Some((id, api_id));
                 vec![Outbound::Legacy(json!({"type": "split", "id": id}))]
             }
+            "transfer_session" => {
+                let id = self.legacy_id();
+                self.pending_fork_id = Some((id, api_id));
+                vec![Outbound::Legacy(json!({"type": "transfer", "id": id}))]
+            }
             "cancel" => {
                 let id = self.legacy_id();
                 self.pending_simple.push((id, api_id, SimpleKind::Ok));
@@ -533,6 +702,10 @@ impl BridgeState {
                     && !images.is_empty()
                 {
                     interrupt["images"] = json!(images);
+                }
+                if let Some(client_id) = request["client_id"].as_str() {
+                    // Older daemons ignore the field, which is harmless here.
+                    interrupt["client_id"] = json!(client_id);
                 }
                 vec![Outbound::Legacy(interrupt)]
             }
@@ -594,6 +767,11 @@ impl BridgeState {
                 let limit = request["limit"].as_u64().map(|limit| limit as usize);
                 let mut ids: BTreeSet<String> =
                     Self::stored_session_ids(limit).into_iter().collect();
+                if limit.is_some() {
+                    // Bookmarks are how users find old work, so a recency
+                    // limit must never hide them from pickers.
+                    ids.extend(Self::saved_session_ids());
+                }
                 let ids_loaded = list_started.elapsed();
                 ids.extend(self.known_sessions.iter().cloned());
                 if let Some(attached) = self.session_id.clone() {
@@ -620,11 +798,23 @@ impl BridgeState {
                     .filter_map(|id| {
                         indexed_metadata
                             .get(id)
-                            .map(PersistedSessionMetadata::from)
+                            .map(|entry| {
+                                let mut metadata = PersistedSessionMetadata::from(entry);
+                                // Rows indexed before labels were tracked have
+                                // no label. Only saved sessions can carry one,
+                                // so the record read stays rare.
+                                if metadata.saved && metadata.save_label.is_none() {
+                                    metadata.save_label = Self::resolve_session_metadata(id)
+                                        .and_then(|record| record.save_label);
+                                }
+                                metadata
+                            })
                             .or_else(|| Self::resolve_session_metadata(id))
                             .map(|metadata| (id.clone(), metadata))
                     })
                     .collect();
+                let mut metadata = metadata;
+                Self::backfill_prompt_titles(&ids, &indexed_metadata, &mut metadata);
                 let metadata_loaded = list_started.elapsed();
                 for id in &ids {
                     if !self.session_dirs.contains_key(id)
@@ -676,6 +866,9 @@ impl BridgeState {
                         },
                         transcript_bytes: Self::transcript_bytes(&session_id),
                         saved: metadata.get(&session_id).is_some_and(|value| value.saved),
+                        save_label: metadata
+                            .get(&session_id)
+                            .and_then(PersistedSessionMetadata::save_label),
                         updated_at_ms: metadata
                             .get(&session_id)
                             .and_then(|value| value.updated_at_ms)
@@ -761,6 +954,34 @@ impl BridgeState {
                 self.pending_simple.push((id, api_id, SimpleKind::Ok));
                 vec![Outbound::Legacy(json!({
                     "type": "notify_auth_changed", "id": id, "provider": provider
+                }))]
+            }
+            "invalidate_usage" => {
+                let legacy_type = match request["provider"].as_str().unwrap_or_default() {
+                    "claude" | "anthropic" => "invalidate_anthropic_usage",
+                    "openai" => "invalidate_openai_usage",
+                    _ => {
+                        return Self::error_reply(
+                            api_id,
+                            ErrorCode::InvalidRequest,
+                            "unsupported usage provider; supported: claude, openai",
+                        );
+                    }
+                };
+                let account_label = request["account_label"].as_str();
+                if account_label.is_some_and(|label| {
+                    label.is_empty() || label.len() > 128 || label.chars().any(char::is_control)
+                }) {
+                    return Self::error_reply(
+                        api_id,
+                        ErrorCode::InvalidRequest,
+                        "invalid account label",
+                    );
+                }
+                let id = self.legacy_id();
+                self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                vec![Outbound::Legacy(json!({
+                    "type": legacy_type, "id": id, "account_label": account_label
                 }))]
             }
             "set_api_key" | "clear_api_key" => {
@@ -869,6 +1090,41 @@ impl BridgeState {
                     Err((code, message)) => Self::error_reply(api_id, code, &message),
                 }
             }
+            "get_todo_state" => {
+                let session_id = request["session_id"].as_str().unwrap_or_default();
+                match Self::todo_home(session_id) {
+                    Ok(home) => vec![Outbound::Reply(ServerFrame::reply(
+                        api_id,
+                        ApiEvent::TodoState {
+                            session_id: session_id.to_string(),
+                            state: jcode_todo_policy::store::load_snapshot(&home, session_id),
+                        },
+                    ))],
+                    Err((code, message)) => Self::error_reply(api_id, code, &message),
+                }
+            }
+            "ack_todo_follow_up" => {
+                let session_id = request["session_id"].as_str().unwrap_or_default();
+                let effects: jcode_todo_policy::TodoEffects =
+                    match serde_json::from_value(request["effects"].clone()) {
+                        Ok(effects) => effects,
+                        Err(error) => {
+                            return Self::error_reply(
+                                api_id,
+                                ErrorCode::InvalidRequest,
+                                &format!("invalid effects: {error}"),
+                            );
+                        }
+                    };
+                let result = Self::todo_home(session_id).and_then(|home| {
+                    jcode_todo_policy::store::apply_effects(&home, session_id, effects)
+                        .map_err(|error| (ErrorCode::Internal, error.to_string()))
+                });
+                match result {
+                    Ok(()) => vec![Outbound::Reply(ServerFrame::reply(api_id, ApiEvent::Ok))],
+                    Err((code, message)) => Self::error_reply(api_id, code, &message),
+                }
+            }
             "file_status" => {
                 let session_id = request["session_id"].as_str().unwrap_or_default();
                 let relative = request["path"].as_str().unwrap_or_default();
@@ -944,24 +1200,127 @@ impl BridgeState {
                 }
                 vec![Outbound::Legacy(rename)]
             }
+            "applet_action" | "close_applet" => {
+                let session_id = request["session_id"]
+                    .as_str()
+                    .filter(|sid| !sid.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| self.session_id.clone());
+                let instance = request["instance"].as_str().unwrap_or_default();
+                let (Some(session_id), false) = (session_id, instance.is_empty()) else {
+                    return Self::error_reply(
+                        api_id,
+                        ErrorCode::InvalidRequest,
+                        "session_id and instance are required",
+                    );
+                };
+                let id = self.legacy_id();
+                self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                let mut out = json!({
+                    "type": req,
+                    "id": id,
+                    "session_id": session_id,
+                    "instance": instance,
+                });
+                if req == "applet_action" {
+                    if !request["action"].is_object() {
+                        self.pending_simple.pop();
+                        return Self::error_reply(
+                            api_id,
+                            ErrorCode::InvalidRequest,
+                            "applet_action requires an action object",
+                        );
+                    }
+                    out["action"] = request["action"].clone();
+                    out["state"] = request.get("state").cloned().unwrap_or(json!({}));
+                    if let Some(key) = request["source_key"].as_str() {
+                        out["source_key"] = json!(key);
+                    }
+                }
+                vec![Outbound::Legacy(out)]
+            }
+            "set_session_saved" => {
+                let id = self.legacy_id();
+                self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                let mut save = json!({
+                    "type": "set_session_saved",
+                    "id": id,
+                    "saved": request["saved"].as_bool().unwrap_or(true),
+                });
+                if let Some(label) = request["label"].as_str() {
+                    save["label"] = json!(label);
+                }
+                vec![Outbound::Legacy(save)]
+            }
             "rewind_undo" => {
                 let id = self.legacy_id();
                 self.pending_simple.push((id, api_id, SimpleKind::Ok));
                 vec![Outbound::Legacy(json!({"type": "rewind_undo", "id": id}))]
             }
             "cancel_soft_interrupts" => {
+                let client_ids = match request.get("client_ids") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(ids)) if ids.iter().all(Value::is_string) => Some(
+                        ids.iter()
+                            .filter_map(|id| id.as_str().map(str::to_string))
+                            .collect::<Vec<_>>(),
+                    ),
+                    Some(_) => {
+                        return Self::error_reply(
+                            api_id,
+                            ErrorCode::InvalidRequest,
+                            "`client_ids` must be an array of strings",
+                        );
+                    }
+                };
                 let id = self.legacy_id();
-                self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                match client_ids {
+                    Some(client_ids) => {
+                        // An older daemon ignores the filter and would clear
+                        // the whole queue: refuse instead of over-cancelling.
+                        if !self.soft_interrupt_ids_supported {
+                            return Self::error_reply(
+                                api_id,
+                                ErrorCode::UnknownRequest,
+                                "daemon does not advertise the soft_interrupt_ids capability",
+                            );
+                        }
+                        self.pending_simple
+                            .push((id, api_id, SimpleKind::SoftInterruptCancel));
+                        vec![Outbound::Legacy(json!({
+                            "type": "cancel_soft_interrupts",
+                            "id": id,
+                            "client_ids": client_ids,
+                        }))]
+                    }
+                    None => {
+                        self.pending_simple.push((id, api_id, SimpleKind::Ok));
+                        vec![Outbound::Legacy(
+                            json!({"type": "cancel_soft_interrupts", "id": id}),
+                        )]
+                    }
+                }
+            }
+            "background_tool" => {
+                let id = self.legacy_id();
+                let kind = if self.soft_interrupt_ids_supported {
+                    SimpleKind::BackgroundTool
+                } else {
+                    SimpleKind::Ok
+                };
+                self.pending_simple.push((id, api_id, kind));
                 vec![Outbound::Legacy(
-                    json!({"type": "cancel_soft_interrupts", "id": id}),
+                    json!({"type": "background_tool", "id": id}),
                 )]
             }
             "detach_session" => {
                 let id = self.legacy_id();
-                vec![
-                    Outbound::Legacy(json!({"type": "prepare_disconnect", "id": id})),
-                    Outbound::Reply(ServerFrame::reply(api_id, ApiEvent::Ok)),
-                ]
+                // Done is the release barrier. The daemon's initial Ack is
+                // sent before it releases SDK callback ownership.
+                self.pending_simple.push((id, api_id, SimpleKind::Detach));
+                vec![Outbound::Legacy(
+                    json!({"type": "prepare_disconnect", "id": id}),
+                )]
             }
             "permission_response" => {
                 // The legacy protocol does not surface permission prompts on
@@ -1021,6 +1380,22 @@ impl BridgeState {
         }))
     }
 
+    fn applet_frame(session_id: &str, snapshot: &Value) -> Option<ServerFrame> {
+        if session_id.is_empty() {
+            return None;
+        }
+        // Missing means empty; malformed must not clear a valid snapshot.
+        let snapshot = if snapshot.is_null() {
+            jcode_harness_api::jcode_applet_types::AgentApplets::default()
+        } else {
+            serde_json::from_value(snapshot.clone()).ok()?
+        };
+        Some(ServerFrame::event(ApiEvent::AppletState {
+            session_id: session_id.to_string(),
+            snapshot,
+        }))
+    }
+
     fn side_panel_frame(session_id: &str, snapshot: &Value) -> Option<ServerFrame> {
         if session_id.is_empty() {
             return None;
@@ -1063,6 +1438,35 @@ impl BridgeState {
         vec![ServerFrame::event(ApiEvent::TextDone {
             session_id: self.session_id.clone().unwrap_or_default(),
             message_id: Some(id),
+        })]
+    }
+
+    fn replace_text_suffix(&mut self, old_text: &str, new_text: &str) -> Vec<ServerFrame> {
+        if old_text.is_empty() {
+            return vec![];
+        }
+        // Citation annotations arrive at output_item.done, immediately before
+        // TextDone. Correct only the active message, never redistribute text
+        // across earlier messages using their pre-correction byte lengths.
+        let Some(id) = self.text_message_id.as_ref() else {
+            return vec![];
+        };
+        let Some((_, text, _)) = self.text_attempt.iter_mut().find(|(key, _, _)| key == id) else {
+            return vec![];
+        };
+        let Some(prefix) = text.strip_suffix(old_text) else {
+            return vec![];
+        };
+        if old_text == new_text {
+            return vec![];
+        }
+        let prefix_len = prefix.len();
+        text.truncate(prefix_len);
+        text.push_str(new_text);
+        vec![ServerFrame::event(ApiEvent::TextReplace {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            message_id: Some(id.clone()),
+            text: text.clone(),
         })]
     }
 
@@ -1119,11 +1523,44 @@ impl BridgeState {
     /// Translate one legacy server event (raw JSON) into API frames.
     pub fn legacy_event_to_api(&mut self, event: &Value) -> Vec<ServerFrame> {
         let kind = event["type"].as_str().unwrap_or("");
+        if kind == "runtime_command_result" {
+            let Some(api_id) = self.take_simple(
+                event["id"].as_u64().unwrap_or(0),
+                SimpleKind::RuntimeCommand,
+            ) else {
+                return vec![];
+            };
+            let Ok(command) = serde_json::from_value(event["command"].clone()) else {
+                return vec![ServerFrame::reply(
+                    api_id,
+                    ApiEvent::Error {
+                        code: ErrorCode::Internal,
+                        message: "Invalid runtime command response".into(),
+                    },
+                )];
+            };
+            return vec![ServerFrame::reply(
+                api_id,
+                ApiEvent::RuntimeCommandResult {
+                    session_id: self.session_id.clone().unwrap_or_default(),
+                    command,
+                    data: event["data"].clone(),
+                    message: event["message"].as_str().unwrap_or("").into(),
+                },
+            )];
+        }
+        // Filter stale owner callbacks before updating any turn/text state.
+        if kind == "tool_call"
+            && (self.session_id.is_none()
+                || event["session_id"].as_str() != self.session_id.as_deref())
+        {
+            return vec![];
+        }
         let session = |state: &Self| state.session_id.clone().unwrap_or_default();
         if self.text_response_ended
             && matches!(
                 kind,
-                "text_delta" | "reasoning_delta" | "tool_start" | "tool_exec"
+                "text_delta" | "reasoning_delta" | "tool_start" | "tool_exec" | "tool_call"
             )
         {
             // A new response or execution commits the previous provider
@@ -1134,13 +1571,65 @@ impl BridgeState {
         }
         if matches!(
             kind,
-            "text_delta" | "reasoning_delta" | "tool_start" | "tool_exec"
-        ) || (kind == "connection_phase" && event["phase"] == "streaming")
+            "text_delta" | "reasoning_delta" | "tool_start" | "tool_exec" | "tool_call"
+        ) || (kind == "connection_phase"
+            && event["phase"].as_str().is_some_and(|phase| {
+                matches!(
+                    phase,
+                    "authenticating"
+                        | "connecting"
+                        | "sending request"
+                        | "waiting for response"
+                        | "streaming"
+                ) || phase.starts_with("retrying (")
+            }))
         {
             self.observed_turn_active = true;
             self.activity_version += 1;
         }
         let mut frames = match kind {
+            "tools" => {
+                let id = event["id"].as_u64().unwrap_or(0);
+                let Some(api_id) = self.take_simple(id, SimpleKind::Tools) else {
+                    return vec![];
+                };
+                let reply = match serde_json::from_value(event["tools"].clone()) {
+                    Ok(tools) => ApiEvent::Tools {
+                        session_id: session(self),
+                        tools,
+                    },
+                    Err(error) => ApiEvent::Error {
+                        code: ErrorCode::Internal,
+                        message: format!("invalid daemon tools response: {error}"),
+                    },
+                };
+                vec![ServerFrame::reply(api_id, reply)]
+            }
+            "tool_call" => {
+                // A custom call is an execution request, not a tool-start update.
+                // Do not manufacture empty identifiers from malformed events.
+                let (Some(call_id), Some(name), Some(input), Some(session_id)) = (
+                    event["call_id"].as_str(),
+                    event["name"].as_str(),
+                    event.get("input"),
+                    event["session_id"].as_str(),
+                ) else {
+                    return vec![];
+                };
+                // The callback owner may have switched attachments since this
+                // event was queued. Never run another session's input using
+                // the newly attached session's handler.
+                if self.session_id.as_deref() != Some(session_id) {
+                    return vec![];
+                }
+                vec![ServerFrame::event(ApiEvent::ToolCall {
+                    session_id: session_id.to_string(),
+                    call_id: call_id.to_string(),
+                    name: name.to_string(),
+                    input: input.clone(),
+                })]
+            }
+
             "session" => {
                 let session_id = event["session_id"].as_str().unwrap_or("").to_string();
                 // `session` is a broadcast lifecycle notification. The daemon
@@ -1153,6 +1642,7 @@ impl BridgeState {
                 vec![ServerFrame::event(ApiEvent::SessionStatus {
                     session_id,
                     status: "attached".into(),
+                    pending_soft_interrupts: None,
                 })]
             }
             "state" => {
@@ -1183,6 +1673,7 @@ impl BridgeState {
                             self.current_model = None;
                             self.current_provider = None;
                             self.current_effort = None;
+                            self.current_credential = None;
                             self.model_catalog_loaded = false;
                         }
                         if self.session_id.as_deref() != Some(&session_id) {
@@ -1198,6 +1689,20 @@ impl BridgeState {
                             event["is_processing"].as_bool().unwrap_or(false);
                     }
                     let metadata = Self::resolve_session_metadata(&session_id);
+                    // New sessions persist nothing until the first prompt.
+                    let working_dir = metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.working_dir.clone())
+                        .or_else(|| self.pending_create_dir.take())
+                        .or_else(|| self.session_dirs.get(&session_id).cloned());
+                    self.pending_create_dir = None;
+                    if let Some(dir) = &working_dir
+                        && !session_id.is_empty()
+                    {
+                        self.session_dirs
+                            .entry(session_id.clone())
+                            .or_insert_with(|| dir.clone());
+                    }
                     let mut frames = vec![ServerFrame::reply(
                         api_id,
                         ApiEvent::Attached {
@@ -1219,9 +1724,7 @@ impl BridgeState {
                                     .as_ref()
                                     .and_then(|value| value.last_active_at_ms),
                                 session_id: session_id.clone(),
-                                working_dir: metadata
-                                    .as_ref()
-                                    .and_then(|metadata| metadata.working_dir.clone()),
+                                working_dir,
                                 title: metadata
                                     .as_ref()
                                     .and_then(PersistedSessionMetadata::display_title),
@@ -1232,11 +1735,17 @@ impl BridgeState {
                                 },
                                 archived: false,
                                 archived_at_ms: None,
+                                save_label: metadata
+                                    .as_ref()
+                                    .and_then(PersistedSessionMetadata::save_label),
                             },
                         },
                     )];
                     if let Some(snapshot) = event.get("side_panel") {
                         frames.extend(Self::side_panel_frame(&session_id, snapshot));
+                    }
+                    if let Some(snapshot) = event.get("applets") {
+                        frames.extend(Self::applet_frame(&session_id, snapshot));
                     }
                     if fresh_activity {
                         frames.push(ServerFrame::event(ApiEvent::SessionStatus {
@@ -1247,6 +1756,9 @@ impl BridgeState {
                                 "idle"
                             }
                             .into(),
+                            pending_soft_interrupts: event["pending_soft_interrupts"]
+                                .as_u64()
+                                .map(|count| count as u32),
                         }));
                     }
                     frames
@@ -1287,6 +1799,14 @@ impl BridgeState {
                 frames
             }
             "text_replace" => self.replace_text(event["text"].as_str().unwrap_or("")),
+            "text_suffix_replace" => {
+                match (event["old_text"].as_str(), event["new_text"].as_str()) {
+                    (Some(old_text), Some(new_text)) => {
+                        self.replace_text_suffix(old_text, new_text)
+                    }
+                    _ => vec![],
+                }
+            }
             "retry_rollback" => {
                 let frames = self.replace_text("");
                 self.text_message_id = None;
@@ -1313,7 +1833,7 @@ impl BridgeState {
             })],
             "tool_input" => vec![ServerFrame::event(ApiEvent::ToolInputDelta {
                 session_id: session(self),
-                call_id: String::new(),
+                call_id: event["id"].as_str().unwrap_or("").to_string(),
                 delta: event["delta"].as_str().unwrap_or("").to_string(),
             })],
             "tool_exec" => {
@@ -1343,6 +1863,17 @@ impl BridgeState {
                     _ => vec![],
                 }
             }
+            "applet_state" => {
+                let session_id = event["session_id"].as_str().or(self.session_id.as_deref());
+                match (session_id, event.get("snapshot")) {
+                    (Some(session_id), Some(snapshot)) if !snapshot.is_null() => {
+                        Self::applet_frame(session_id, snapshot)
+                            .into_iter()
+                            .collect()
+                    }
+                    _ => vec![],
+                }
+            }
             "side_pane_images" => vec![ServerFrame::event(ApiEvent::SidePaneImages {
                 session_id: event["session_id"]
                     .as_str()
@@ -1357,8 +1888,30 @@ impl BridgeState {
                 cache_read_input: event["cache_read_input"].as_u64(),
                 cache_creation_input: event["cache_creation_input"].as_u64(),
             })],
+            "kv_cache_miss" => vec![ServerFrame::event(ApiEvent::KvCacheMiss {
+                session_id: session(self),
+                reason: event["reason"].as_str().unwrap_or("unknown").to_string(),
+                harness_caused: event["harness_caused"].as_bool().unwrap_or(false),
+                missed_tokens: event["missed_tokens"].as_u64().unwrap_or(0),
+                expected_tokens: event["expected_tokens"].as_u64().unwrap_or(0),
+                read_tokens: event["read_tokens"].as_u64().unwrap_or(0),
+                documented_cause: event["documented_cause"].as_str().map(str::to_string),
+                message: event["message"]
+                    .as_str()
+                    .unwrap_or("KV cache miss")
+                    .to_string(),
+            })],
             "done" => {
                 let id = event["id"].as_u64().unwrap_or(0);
+                if let Some(api_id) = self.take_simple(id, SimpleKind::Detach) {
+                    self.pending_control_done_ids.remove(&id);
+                    self.session_id = None;
+                    self.turn_stop_reported = false;
+                    self.observed_turn_active = false;
+                    self.text_message_id = None;
+                    self.text_attempt.clear();
+                    return vec![ServerFrame::reply(api_id, ApiEvent::Ok)];
+                }
                 // Subscribe and controls also emit `done`. Exclude their ids,
                 // but retain session-scoped completions fanned out by another
                 // attachment or a server-initiated turn (whose id is zero).
@@ -1369,6 +1922,7 @@ impl BridgeState {
                     self.observed_turn_active && !control_done && self.session_id.is_some();
                 if completed_message || completed_idle_interrupt || observed_done {
                     self.observed_turn_active = false;
+                    self.turn_stop_reported = false;
                     self.activity_version += 1;
                     self.pending_message_id = None;
                     // Any other retained soft interrupts were queued into the
@@ -1378,21 +1932,61 @@ impl BridgeState {
                     self.text_attempt.clear();
                     frames.push(ServerFrame::event(ApiEvent::TurnDone {
                         session_id: session(self),
+                        pending_soft_interrupts: self.pending_soft_interrupts_at_done.take(),
                     }));
                     frames
                 } else {
                     vec![]
                 }
             }
+            "turn_stopped" | "provider_guardrail" => {
+                if self.session_id.is_none() || self.turn_stop_reported {
+                    return vec![];
+                }
+                self.turn_stop_reported = true;
+                self.observed_turn_active = true;
+                let reason = if kind == "provider_guardrail" {
+                    jcode_harness_api::TurnStopReason::ProviderGuardrail
+                } else {
+                    serde_json::from_value(event["reason"].clone())
+                        .unwrap_or(jcode_harness_api::TurnStopReason::Unknown)
+                };
+                vec![ServerFrame::event(ApiEvent::TurnStopped {
+                    session_id: session(self),
+                    reason,
+                    message: event["message"]
+                        .as_str()
+                        .unwrap_or("The turn stopped unexpectedly.")
+                        .to_string(),
+                    provider_stop_reason: event["provider_stop_reason"]
+                        .as_str()
+                        .or_else(|| event["stop_reason"].as_str())
+                        .map(str::to_string),
+                })]
+            }
             "interrupted" => {
                 self.activity_version += 1;
-                self.observed_turn_active = false;
-                self.text_message_id = None;
-                self.text_attempt.clear();
-                vec![ServerFrame::event(ApiEvent::SessionStatus {
+                let mut frames = vec![];
+                // Older runtimes may only emit Interrupted. An idle cancel is
+                // not an abnormal turn, and a late notice after Done is not a
+                // second stop. Keep observed activity until Done for observers.
+                if !self.turn_stop_reported
+                    && (self.observed_turn_active || self.pending_message_id.is_some())
+                {
+                    self.turn_stop_reported = true;
+                    frames.push(ServerFrame::event(ApiEvent::TurnStopped {
+                        session_id: session(self),
+                        reason: jcode_harness_api::TurnStopReason::Interrupted,
+                        message: "The turn was interrupted by a cancellation request.".into(),
+                        provider_stop_reason: None,
+                    }));
+                }
+                frames.push(ServerFrame::event(ApiEvent::SessionStatus {
                     session_id: session(self),
                     status: "cancelled".into(),
-                })]
+                    pending_soft_interrupts: None,
+                }));
+                frames
             }
             "wake_requested" => vec![ServerFrame::event(ApiEvent::WakeRequested {
                 session_id: event["session_id"]
@@ -1458,6 +2052,9 @@ impl BridgeState {
                             status: "idle".into(),
                             archived: false,
                             archived_at_ms: None,
+                            save_label: metadata
+                                .as_ref()
+                                .and_then(PersistedSessionMetadata::save_label),
                         },
                     },
                 )]
@@ -1488,6 +2085,10 @@ impl BridgeState {
                     frames.extend(Self::side_panel_frame(
                         event["session_id"].as_str().unwrap_or_default(),
                         &event["side_panel"],
+                    ));
+                    frames.extend(Self::applet_frame(
+                        event["session_id"].as_str().unwrap_or_default(),
+                        &event["applets"],
                     ));
                     return frames;
                 }
@@ -1562,6 +2163,7 @@ impl BridgeState {
                     frames.push(ServerFrame::event(ApiEvent::SessionStatus {
                         session_id: session(self),
                         status: if active { "running" } else { "idle" }.into(),
+                        pending_soft_interrupts: None,
                     }));
                 }
                 // Correlation establishes ownership, but reject a conflicting
@@ -1571,6 +2173,7 @@ impl BridgeState {
                     .is_none_or(|sid| Some(sid) == self.session_id.as_deref())
                 {
                     frames.extend(Self::side_panel_frame(&session(self), &event["side_panel"]));
+                    frames.extend(Self::applet_frame(&session(self), &event["applets"]));
                 }
                 frames
             }
@@ -1599,11 +2202,19 @@ impl BridgeState {
                 if let Some(provider) = event["provider_name"].as_str() {
                     self.note_provider(provider);
                 }
+                self.note_credential(event);
+                // Newer daemons report the effort the switched-to model runs
+                // with (`null` when the switch cleared it). Older ones omit
+                // the key, so the cached value is kept as before.
+                if event.get("reasoning_effort").is_some() {
+                    self.current_effort = event["reasoning_effort"].as_str().map(str::to_string);
+                }
                 let info = ApiEvent::ModelInfo {
                     session_id: session(self),
                     provider: self.current_provider.clone(),
                     model: self.current_model.clone(),
                     reasoning_effort: self.current_effort.clone(),
+                    auth_method: self.current_credential.clone(),
                 };
                 // Both a reply and a broadcast: the caller needs its request
                 // resolved, and every other client watching the session needs
@@ -1620,13 +2231,14 @@ impl BridgeState {
                 let id = event["id"].as_u64().unwrap_or(0);
                 // Remember the new effort even when the change was requested by
                 // another client, so later identity events stay truthful.
-                let changed = event["error"].as_str().is_none()
-                    && event["effort"].as_str().is_some_and(|effort| {
-                        let effort = Some(effort.to_string());
-                        let moved = self.current_effort != effort;
-                        self.current_effort = effort;
-                        moved
-                    });
+                // A success without `effort` means the provider now runs with
+                // none (e.g. `none` normalised away), which is also a change.
+                let changed = event["error"].as_str().is_none() && {
+                    let effort = event["effort"].as_str().map(str::to_string);
+                    let moved = self.current_effort != effort;
+                    self.current_effort = effort;
+                    moved
+                };
                 // A successful change is also broadcast as identity, mirroring
                 // model_changed: every attached client needs to know the
                 // effort moved under it, not only the one that asked.
@@ -1636,6 +2248,7 @@ impl BridgeState {
                         provider: self.current_provider.clone(),
                         model: self.current_model.clone(),
                         reasoning_effort: self.current_effort.clone(),
+                        auth_method: self.current_credential.clone(),
                     })
                 });
                 let Some(api_id) = self.take_simple(id, SimpleKind::ReasoningEffort) else {
@@ -1749,6 +2362,10 @@ impl BridgeState {
                 // can move a message from "sent" to "acknowledged" without
                 // waiting for the first token of the reply.
                 if self.pending_message_id == Some(id) {
+                    // Acceptance starts a turn before any provider output. An
+                    // older idle snapshot must not stop this pre-stream turn.
+                    self.observed_turn_active = true;
+                    self.activity_version += 1;
                     return vec![ServerFrame::event(ApiEvent::MessageAccepted {
                         session_id: session(self),
                     })];
@@ -1762,7 +2379,9 @@ impl BridgeState {
                 };
                 let (_, api_id, kind) = self.pending_simple.remove(index);
                 match kind {
-                    SimpleKind::Ok => vec![ServerFrame::reply(api_id, ApiEvent::Ok)],
+                    SimpleKind::Ok | SimpleKind::ToolControl => {
+                        vec![ServerFrame::reply(api_id, ApiEvent::Ok)]
+                    }
                     SimpleKind::Credential {
                         provider,
                         configured,
@@ -1781,6 +2400,26 @@ impl BridgeState {
                 }
             }
             "error" => {
+                // A rejected tool configuration/result is not a failed model
+                // turn. Preserve streaming state and correlate only its request.
+                let id = event["id"].as_u64().unwrap_or(0);
+                if let Some(index) = self
+                    .pending_simple
+                    .iter()
+                    .position(|(pending_id, _, kind)| {
+                        *pending_id == id
+                            && matches!(kind, SimpleKind::Tools | SimpleKind::ToolControl)
+                    })
+                {
+                    let (_, api_id, _) = self.pending_simple.remove(index);
+                    return vec![ServerFrame::reply(
+                        api_id,
+                        ApiEvent::Error {
+                            code: ErrorCode::Internal,
+                            message: event["message"].as_str().unwrap_or_default().to_string(),
+                        },
+                    )];
+                }
                 self.activity_version += 1;
                 self.observed_turn_active = false;
                 let id = event["id"].as_u64().unwrap_or(0);
@@ -1842,10 +2481,90 @@ impl BridgeState {
                     code: ErrorCode::Internal,
                     message,
                 };
-                vec![match reply_to {
+                let mut frames = vec![match reply_to {
                     Some(api_id) => ServerFrame::reply(api_id, frame_event),
                     None => ServerFrame::event(frame_event),
-                }]
+                }];
+                if reply_to.is_none() && self.turn_stop_reported {
+                    self.turn_stop_reported = false;
+                    self.pending_message_id = None;
+                    self.pending_soft_interrupt_ids.clear();
+                    frames.extend(self.finish_text());
+                    self.text_attempt.clear();
+                    frames.push(ServerFrame::event(ApiEvent::TurnDone {
+                        session_id: session(self),
+                        pending_soft_interrupts: self.pending_soft_interrupts_at_done.take(),
+                    }));
+                }
+                frames
+            }
+            "soft_interrupt_injected" => {
+                // Daemon-originated injections (background task results,
+                // system notes) are also turn boundaries an embedder may care
+                // about, so forward every injection, not only id-bearing ones.
+                let client_ids = event["client_ids"]
+                    .as_array()
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| id.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Injection precedes the response that sees it: whatever text
+                // was open belongs to the previous response.
+                let mut frames = self.finish_text();
+                self.observed_turn_active = true;
+                self.activity_version += 1;
+                frames.push(ServerFrame::event(ApiEvent::SoftInterruptInjected {
+                    session_id: session(self),
+                    client_ids,
+                    point: event["point"].as_str().unwrap_or("").to_string(),
+                    tools_skipped: event["tools_skipped"].as_u64().map(|n| n as u32),
+                    display_role: event["display_role"].as_str().map(str::to_string),
+                }));
+                frames
+            }
+            "soft_interrupt_queue" => {
+                let pending = event["pending"].as_u64().unwrap_or(0) as u32;
+                self.pending_soft_interrupts_at_done = (pending > 0).then_some(pending);
+                vec![]
+            }
+            "soft_interrupts_cancelled" => {
+                let id = event["id"].as_u64().unwrap_or(0);
+                let Some(api_id) = self.take_simple(id, SimpleKind::SoftInterruptCancel) else {
+                    return vec![];
+                };
+                let strings = |key: &str| -> Vec<String> {
+                    event[key]
+                        .as_array()
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(|id| id.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                vec![ServerFrame::reply(
+                    api_id,
+                    ApiEvent::SoftInterruptsCancelled {
+                        cancelled: strings("cancelled"),
+                        not_queued: strings("not_queued"),
+                    },
+                )]
+            }
+            "background_tool_result" => {
+                let id = event["id"].as_u64().unwrap_or(0);
+                let Some(api_id) = self.take_simple(id, SimpleKind::BackgroundTool) else {
+                    return vec![];
+                };
+                vec![ServerFrame::reply(
+                    api_id,
+                    ApiEvent::BackgroundToolResult {
+                        moved: event["moved"].as_bool().unwrap_or(false),
+                        tool_call_id: event["tool_call_id"].as_str().map(str::to_string),
+                        tool_name: event["tool_name"].as_str().map(str::to_string),
+                    },
+                )]
             }
             // Everything else on the legacy stream is not part of the stable
             // API surface yet; drop it.
@@ -1888,6 +2607,7 @@ impl BridgeState {
         if let Some(provider) = event["provider_name"].as_str() {
             self.note_provider(provider);
         }
+        self.note_credential(event);
         if event.get("reasoning_effort").is_some() {
             self.current_effort = event["reasoning_effort"].as_str().map(str::to_string);
         }
@@ -1929,12 +2649,21 @@ impl BridgeState {
         self.current_provider = Some(provider.to_string());
     }
 
+    /// Remember the credential the daemon resolved, when the event says.
+    /// Older daemons omit the key, which keeps the last known value.
+    fn note_credential(&mut self, event: &Value) {
+        if let Some(credential) = event.get("resolved_credential") {
+            self.current_credential = credential.as_str().map(str::to_string);
+        }
+    }
+
     fn runtime_info(&self) -> ApiEvent {
         ApiEvent::RuntimeInfo {
             session_id: self.session_id.clone().unwrap_or_default(),
             provider: self.current_provider.clone(),
             model: self.current_model.clone(),
             reasoning_effort: self.current_effort.clone(),
+            auth_method: self.current_credential.clone(),
             routes: self.available_routes.clone(),
         }
     }
@@ -1948,6 +2677,7 @@ impl BridgeState {
                 .as_str()
                 .map(str::to_string)
                 .or_else(|| self.current_effort.clone()),
+            auth_method: self.current_credential.clone(),
         }
     }
 
@@ -2032,6 +2762,8 @@ impl BridgeState {
             saved: Self::metadata_bool(&tail, "saved", true)
                 .or_else(|| Self::metadata_bool(&head, "saved", false))
                 .unwrap_or(false),
+            save_label: Self::metadata_string(&tail, "save_label", true)
+                .or_else(|| Self::metadata_string(&head, "save_label", true)),
             updated_at_ms: None,
             last_active_at_ms: None,
             working_dir: Self::metadata_string(&tail, "working_dir", true)
@@ -2045,7 +2777,11 @@ impl BridgeState {
             .windows(needle.len())
             .enumerate()
             .filter_map(|(at, window)| (window == needle.as_bytes()).then_some(at + needle.len()));
-        let start = if last { starts.last()? } else { starts.next()? };
+        let start = if last {
+            starts.next_back()?
+        } else {
+            starts.next()?
+        };
         Option::<String>::deserialize(&mut serde_json::Deserializer::from_slice(&bytes[start..]))
             .ok()
             .flatten()
@@ -2099,6 +2835,14 @@ impl BridgeState {
             .as_millis() as u64
     }
 
+    /// Jcode home for a todo-state request, rejecting ids unsafe for a path.
+    fn todo_home(session_id: &str) -> Result<std::path::PathBuf, (ErrorCode, String)> {
+        if !jcode_todo_policy::store::is_safe_session_id(session_id) {
+            return Err((ErrorCode::InvalidRequest, "invalid session_id".to_string()));
+        }
+        Self::jcode_home().ok_or_else(|| (ErrorCode::Internal, "no jcode home".to_string()))
+    }
+
     fn jcode_home() -> Option<std::path::PathBuf> {
         std::env::var_os("JCODE_HOME")
             .map(std::path::PathBuf::from)
@@ -2109,6 +2853,142 @@ impl BridgeState {
 
     fn recent_session_index_path() -> Option<std::path::PathBuf> {
         Some(Self::jcode_home()?.join("session-metadata-v1.sqlite3"))
+    }
+
+    /// Name sessions recorded before first-prompt titles existed. Each
+    /// session is derived once and cached in the shared index (an empty
+    /// value marks "no usable prompt"). The work is time-boxed per request,
+    /// newest first, so a large backlog is spread across list calls.
+    fn backfill_prompt_titles(
+        ids: &BTreeSet<String>,
+        indexed: &BTreeMap<String, RecentSessionIndexEntry>,
+        metadata: &mut BTreeMap<String, PersistedSessionMetadata>,
+    ) {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let mut pending: Vec<_> = ids
+            .iter()
+            .filter_map(|id| indexed.get(id))
+            .filter(|entry| entry.generated_title.is_none())
+            .collect();
+        pending.sort_by_key(|entry| {
+            std::cmp::Reverse(entry.last_active_at_ms.unwrap_or(entry.updated_at_ms))
+        });
+        for entry in pending {
+            if started.elapsed() > BUDGET {
+                break;
+            }
+            let id = &entry.session_id;
+            let title = Self::first_prompt_title(id);
+            // Empty marks "no usable prompt" so the record is not rescanned.
+            if let Some(path) = Self::recent_session_index_path()
+                && let Ok(connection) = Connection::open(path)
+            {
+                let _ = connection.execute(
+                    "UPDATE recent_sessions SET generated_title = ?2
+                     WHERE session_id = ?1 AND generated_title IS NULL",
+                    params![id, title.clone().unwrap_or_default()],
+                );
+            }
+            if let Some(title) = title
+                && let Some(value) = metadata.get_mut(id)
+            {
+                value.title = Some(title);
+            }
+        }
+    }
+
+    /// Title derived from a session's first visible user prompt, matching the
+    /// runtime's own fallback. Streams the record so only that prompt's text
+    /// is materialized, then falls back to the append journal.
+    fn first_prompt_title(session_id: &str) -> Option<String> {
+        use serde::de::{IgnoredAny, SeqAccess, Visitor};
+
+        #[derive(Deserialize)]
+        struct LiteBlock {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            text: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct LiteMessage {
+            role: String,
+            #[serde(default)]
+            display_role: Option<IgnoredAny>,
+            #[serde(default)]
+            content: Vec<LiteBlock>,
+        }
+        impl LiteMessage {
+            fn title(&self) -> Option<String> {
+                if self.role != "user" || self.display_role.is_some() {
+                    return None;
+                }
+                let mut texts = self
+                    .content
+                    .iter()
+                    .filter(|block| block.kind == "text")
+                    .filter_map(|block| block.text.as_deref());
+                let first = texts.next()?;
+                if first.trim_start().starts_with("<system-reminder>") {
+                    return None;
+                }
+                std::iter::once(first)
+                    .chain(texts)
+                    .find_map(jcode_session_types::prompt_title)
+            }
+        }
+        #[derive(Default)]
+        struct FirstPrompt(Option<String>);
+        impl<'de> Deserialize<'de> for FirstPrompt {
+            fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+                struct Scan;
+                impl<'de> Visitor<'de> for Scan {
+                    type Value = FirstPrompt;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a message list")
+                    }
+                    fn visit_seq<A: SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<FirstPrompt, A::Error> {
+                        let mut found = None;
+                        while found.is_none() {
+                            match seq.next_element::<LiteMessage>()? {
+                                Some(message) => found = message.title(),
+                                None => return Ok(FirstPrompt(None)),
+                            }
+                        }
+                        while seq.next_element::<IgnoredAny>()?.is_some() {}
+                        Ok(FirstPrompt(found))
+                    }
+                }
+                de.deserialize_seq(Scan)
+            }
+        }
+        #[derive(Deserialize)]
+        struct Record {
+            #[serde(default)]
+            messages: FirstPrompt,
+        }
+        #[derive(Deserialize)]
+        struct JournalEntry {
+            #[serde(default)]
+            append_messages: FirstPrompt,
+        }
+
+        let path = Self::session_record_path(session_id)?;
+        let file = std::fs::File::open(&path).ok()?;
+        let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+        if let Some(title) = Record::deserialize(&mut de).ok().and_then(|r| r.messages.0) {
+            return Some(title);
+        }
+        let journal = path.with_file_name(format!("{session_id}.journal.jsonl"));
+        let reader = std::io::BufReader::new(std::fs::File::open(journal).ok()?);
+        std::io::BufRead::lines(reader)
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str::<JournalEntry>(&line).ok())
+            .find_map(|entry| entry.append_messages.0)
     }
 
     fn recent_session_index_entries() -> Vec<RecentSessionIndexEntry> {
@@ -2130,7 +3010,8 @@ impl BridgeState {
                      todo_title TEXT,
                      updated_at_ms INTEGER NOT NULL,
                      last_active_at_ms INTEGER,
-                     saved INTEGER NOT NULL DEFAULT 0
+                     saved INTEGER NOT NULL DEFAULT 0,
+                     save_label TEXT
                  );
                  CREATE INDEX IF NOT EXISTS recent_sessions_activity
                  ON recent_sessions(COALESCE(last_active_at_ms, updated_at_ms) DESC);",
@@ -2143,9 +3024,10 @@ impl BridgeState {
             "ALTER TABLE recent_sessions ADD COLUMN saved INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = connection.execute("ALTER TABLE recent_sessions ADD COLUMN save_label TEXT", []);
         let Ok(mut statement) = connection.prepare(
             "SELECT session_id, working_dir, generated_title, custom_title,
-                    todo_title, saved, updated_at_ms, last_active_at_ms
+                    todo_title, saved, updated_at_ms, last_active_at_ms, save_label
              FROM recent_sessions
              ORDER BY COALESCE(last_active_at_ms, updated_at_ms) DESC
              LIMIT 500",
@@ -2163,8 +3045,27 @@ impl BridgeState {
                     saved: row.get(5)?,
                     updated_at_ms: row.get(6)?,
                     last_active_at_ms: row.get(7)?,
+                    save_label: row.get(8)?,
                 })
             })
+            .and_then(|rows| rows.collect())
+            .unwrap_or_default()
+    }
+
+    fn saved_session_ids() -> Vec<String> {
+        let Some(path) = Self::recent_session_index_path() else {
+            return Vec::new();
+        };
+        let Ok(connection) = Connection::open(path) else {
+            return Vec::new();
+        };
+        let Ok(mut statement) =
+            connection.prepare("SELECT session_id FROM recent_sessions WHERE saved != 0")
+        else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| row.get(0))
             .and_then(|rows| rows.collect())
             .unwrap_or_default()
     }
@@ -2238,9 +3139,12 @@ impl BridgeState {
         // `stat` is the dominant cost with 100k+ sessions. Match the TUI picker
         // by doing those independent filesystem calls concurrently rather than
         // serially blocking the API reply long enough for clients to time out.
+        // Stat is I/O-bound, so a few threads capture the parallelism; one per
+        // core only multiplied allocator arenas in this long-lived process.
         let workers = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
+            .min(4)
             .min(candidates.len().max(1));
         let chunk_size = candidates.len().div_ceil(workers);
         let mut ids = std::thread::scope(|scope| {
@@ -2262,7 +3166,7 @@ impl BridgeState {
                 .flat_map(|handle| handle.join().unwrap_or_default())
                 .collect::<Vec<_>>()
         });
-        ids.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+        ids.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         Self::write_bootstrap_recent_session_index(&ids);
         if let Some(limit) = limit {
             ids.truncate(limit);

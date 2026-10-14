@@ -54,6 +54,8 @@ fn test_usage_report_updates_display_only_card_without_system_message() {
         }],
         extra_info: vec![("plan".to_string(), "pro".to_string())],
         hard_limit_reached: false,
+        openai_reset_credits: None,
+        anthropic_limit_reset: None,
         error: None,
         last_used_unix_secs: None,
     }]);
@@ -90,6 +92,8 @@ fn test_usage_progress_updates_card_incrementally() {
             }],
             extra_info: Vec::new(),
             hard_limit_reached: false,
+            openai_reset_credits: None,
+            anthropic_limit_reset: None,
             error: None,
             last_used_unix_secs: None,
         }],
@@ -269,8 +273,18 @@ fn test_account_command_opens_account_picker() {
                 }) if provider_id == "claude" && label == "claude-otter"
             )
         }));
-        assert!(picker.entries.iter().any(|entry| entry.name == "Claude"));
-        assert!(picker.entries.iter().any(|entry| entry.name == "OpenAI"));
+        assert!(
+            picker
+                .entries
+                .iter()
+                .any(|entry| entry.name == "Claude · claude@example.com")
+        );
+        assert!(
+            picker
+                .entries
+                .iter()
+                .any(|entry| entry.name == "OpenAI · user@example.com")
+        );
         assert!(picker.entries.iter().any(|entry| {
             matches!(
                 entry.action,
@@ -341,13 +355,13 @@ fn test_account_picker_supports_arrow_and_vim_navigation() {
             picker
                 .entries
                 .iter()
-                .any(|entry| entry.name == "OpenAI Otter")
+                .any(|entry| entry.name == "OpenAI Otter · first@example.com")
         );
         assert!(
             picker
                 .entries
                 .iter()
-                .any(|entry| entry.name == "OpenAI Fox")
+                .any(|entry| entry.name == "OpenAI Fox · second@example.com")
         );
 
         app.handle_key(KeyCode::Down, KeyModifiers::empty())
@@ -487,6 +501,61 @@ fn test_account_command_combines_claude_and_openai_accounts() {
     });
 }
 
+#[test]
+fn test_account_picker_renders_each_oauth_email_in_combined_and_scoped_views() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    with_temp_jcode_home(|| {
+        let expires = chrono::Utc::now().timestamp_millis() + 60_000;
+        let claude_emails = ["claude.personal@example.com", "claude.work@example.com"];
+        let openai_emails = ["openai.personal@example.com", "openai.work@example.com"];
+        for (index, email) in claude_emails.iter().enumerate() {
+            crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
+                label: format!("claude-{}", index + 1),
+                access: "access".to_string(),
+                refresh: "refresh".to_string(),
+                expires,
+                email: Some((*email).to_string()),
+                scopes: Vec::new(),
+                subscription_type: Some("pro".to_string()),
+            })
+            .unwrap();
+        }
+        for (index, email) in openai_emails.iter().enumerate() {
+            crate::auth::codex::upsert_account(crate::auth::codex::OpenAiAccount {
+                label: format!("openai-{}", index + 1),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                id_token: None,
+                account_id: Some(format!("acct_{index}")),
+                expires_at: Some(expires),
+                email: Some((*email).to_string()),
+            })
+            .unwrap();
+        }
+        let mut app = create_test_app();
+        for scope in [None, Some("claude"), Some("openai")] {
+            app.open_account_picker(scope);
+            for preview in [false, true] {
+                app.inline_interactive_state.as_mut().unwrap().preview = preview;
+                let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+                terminal
+                    .draw(|frame| crate::tui::ui::draw(frame, &app))
+                    .unwrap();
+                let rendered = buffer_to_text(&terminal);
+                for email in claude_emails.iter().chain(openai_emails.iter()) {
+                    let expected = scope.is_none() || email.starts_with(scope.unwrap());
+                    assert_eq!(
+                        rendered.contains(email),
+                        expected,
+                        "scope {scope:?}, preview {preview}: {rendered}"
+                    );
+                }
+            }
+        }
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn test_account_command_uses_fast_auth_snapshot_without_running_cursor_status() {
@@ -537,26 +606,46 @@ fn test_account_switch_shorthand_switches_openai_account_by_label() {
     with_temp_jcode_home(|| {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        crate::auth::codex::upsert_account(crate::auth::codex::OpenAiAccount {
-            label: "openai2".to_string(),
+        // `account_store::upsert_account` ignores the requested label for a new
+        // account and assigns its own canonical one (`openai-<animal>`), so the
+        // switch has to use the label it actually returns.
+        let open_account = |account_id: &str, email: &str| crate::auth::codex::OpenAiAccount {
+            label: String::new(),
             access_token: "acc".to_string(),
             refresh_token: "ref".to_string(),
             id_token: None,
-            account_id: Some("acct_openai2".to_string()),
+            account_id: Some(account_id.to_string()),
             expires_at: Some(now_ms + 60_000),
-            email: Some("user2@example.com".to_string()),
-        })
-        .unwrap();
+            email: Some(email.to_string()),
+        };
+
+        // Two accounts, because a single account is auto-activated on insert:
+        // switching to the account that is already active would pass even if the
+        // `/account switch` command did nothing. The first insert stays active
+        // and the switch below has to move it to the second.
+        let first =
+            crate::auth::codex::upsert_account(open_account("acct_first", "first@example.com"))
+                .unwrap();
+        let second =
+            crate::auth::codex::upsert_account(open_account("acct_second", "second@example.com"))
+                .unwrap();
+        assert_ne!(first, second, "the two inserts must get distinct labels");
+        assert_eq!(
+            crate::auth::codex::active_account_label().as_deref(),
+            Some(first.as_str()),
+            "the first inserted account is the active one before the switch"
+        );
 
         let mut app = create_test_app();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            app.input = "/account switch openai2".to_string();
+            app.input = format!("/account switch {second}");
             app.submit_input();
 
             assert_eq!(
                 crate::auth::codex::active_account_label().as_deref(),
-                Some("openai-1")
+                Some(second.as_str()),
+                "the shorthand must move the active account to the requested label"
             );
         });
     });

@@ -368,6 +368,14 @@ fn push_user_prompt_lines(
 ) {
     let prefix_width = unicode_width::UnicodeWidthStr::width(prompt_num.to_string().as_str())
         + unicode_width::UnicodeWidthStr::width("› ");
+    // Voice prompts carry <transcription> tags for the model. Show the spoken
+    // words with a mic marker instead, like Jcode Desktop.
+    let (visible, transcribed) = jcode_session_types::strip_transcription(content);
+    let content: &str = if transcribed {
+        &format!("🎙 {visible}")
+    } else {
+        content
+    };
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     for (line_idx, content_line) in normalized.split('\n').enumerate() {
         let raw_line = raw_plain_lines.len();
@@ -739,7 +747,8 @@ pub(super) fn prepare_messages(
 /// so the same value can be re-applied above the header once messages exist,
 /// keeping the header from jumping when the first prompt is sent.
 fn initial_header_pad_top(height: u16, header_lines: usize) -> usize {
-    let input_reserve = 4;
+    // Input chrome plus the always-pinned session status line below it.
+    let input_reserve = 5;
     let available = (height as usize).saturating_sub(input_reserve);
     available.saturating_sub(header_lines) / 2
 }
@@ -1057,6 +1066,11 @@ fn header_prep_signature(app: &dyn TuiState, width: u16) -> u64 {
     app.connected_clients().hash(&mut hasher);
     app.server_sessions().len().hash(&mut hasher);
     app.working_dir().hash(&mut hasher);
+    // The directory row renders `(branch)`. The branch arrives from the async
+    // git probe, so without this the header kept the branch-less row until an
+    // unrelated field changed (or the 30s TTL lapsed), and a `git switch` did
+    // not show in the header at all.
+    app.git_branch().hash(&mut hasher);
     // Credential changes alter the auth inventory lines. Hashing the auth
     // generation (cheap atomic load) means `/login` and account edits repaint
     // the header on the very next frame instead of waiting out the TTL, which
@@ -1388,6 +1402,15 @@ fn render_message_into(
             .as_ref()
             .is_some_and(|tool| tools_ui::canonical_tool_name(&tool.name) == "todo")
     {
+        // Hidden messages still occupy a position in the transcript cache.
+        // Without this zero-length boundary, incremental updates compare later
+        // messages against the wrong indices and can truncate earlier content.
+        acc.segments.push((
+            msg.stable_cache_hash(),
+            acc.lines.len(),
+            acc.raw_plain_lines.len(),
+            acc.user_prompt_texts.len(),
+        ));
         return;
     }
     let align = default_message_alignment(role, centered);
@@ -1546,7 +1569,7 @@ fn render_message_into(
                                 .get("patch_text")
                                 .and_then(|v| v.as_str())
                                 .and_then(|patch_text| {
-                                    match tools_ui::canonical_tool_name(&tc.name) {
+                                    match tools_ui::edit_render_name(&tc.name, &tc.input) {
                                         "apply_patch" => {
                                             tools_ui::extract_apply_patch_primary_file(patch_text)
                                         }
@@ -1558,8 +1581,13 @@ fn render_message_into(
                                 })
                         })
                         .unwrap_or_else(|| "unknown".to_string());
-                    let expandable =
-                        messages::edit_tool_inline_diff_is_expandable(tc, &msg.content, width);
+                    // Outside the inline modes the diff body is hidden entirely,
+                    // so any edit with a diff can be expanded into full inline.
+                    let expandable = if app.diff_mode().is_inline() {
+                        messages::edit_tool_inline_diff_is_expandable(tc, &msg.content, width)
+                    } else {
+                        messages::edit_tool_has_inline_diff(tc, &msg.content)
+                    };
                     acc.edit_tool_line_ranges.push((
                         msg_global_idx,
                         file_path,

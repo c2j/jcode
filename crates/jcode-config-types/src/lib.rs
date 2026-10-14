@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 mod display;
-pub use display::DisplayConfig;
+mod menubar;
+mod power;
+pub use {display::DisplayConfig, menubar::MenubarConfig, power::PowerConfig};
 pub mod keybindings;
 mod serde_lenient;
 pub use keybindings::{
@@ -154,30 +156,6 @@ mod diff_display_mode_tests {
                 serde_json::from_str::<DiffDisplayMode>(&encoded).unwrap(),
                 mode
             );
-        }
-    }
-}
-
-/// When to show the overscroll status line (model/provider/context info below
-/// the input).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OverscrollStatusMode {
-    /// Never show the status line.
-    Off,
-    /// Always show the status line below the input.
-    On,
-    /// Elastic reveal: show it briefly when scrolling past the bottom (default).
-    #[default]
-    Overscroll,
-}
-
-impl OverscrollStatusMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::On => "on",
-            Self::Overscroll => "overscroll",
         }
     }
 }
@@ -658,6 +636,22 @@ pub struct AgentsConfig {
     /// Env override: `JCODE_SWARM_MAX_CONCURRENT_AGENTS`.
     #[serde(default = "default_swarm_max_concurrent_agents")]
     pub swarm_max_concurrent_agents: usize,
+    /// Stalled-worker watchdog window in seconds. A running swarm worker with
+    /// no streamed tokens, tool events, or task heartbeats for this long, and
+    /// no tool currently executing, is flagged as stalled in swarm status and
+    /// its coordinator is notified once. `0` disables the watchdog.
+    /// Env override: `JCODE_SWARM_STALL_AFTER_SECS`.
+    #[serde(default = "default_swarm_stall_after_secs")]
+    pub swarm_stall_after_secs: u64,
+    /// When the watchdog flags a worker as stalled, also queue a short nudge
+    /// message into the worker's own session. Off by default.
+    /// Env override: `JCODE_SWARM_STALL_NUDGE`.
+    #[serde(default)]
+    pub swarm_stall_nudge: bool,
+}
+
+fn default_swarm_stall_after_secs() -> u64 {
+    600
 }
 
 fn default_swarm_max_concurrent_agents() -> usize {
@@ -714,6 +708,8 @@ impl Default for AgentsConfig {
             memory_embedding_base_url: None,
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
+            swarm_stall_after_secs: default_swarm_stall_after_secs(),
+            swarm_stall_nudge: false,
         }
     }
 }
@@ -918,6 +914,12 @@ impl<'de> Deserialize<'de> for HookCommands {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HooksConfig {
+    /// Synchronous input transformers run before each tool call. Each receives
+    /// the tool input JSON on stdin and may print replacement JSON on stdout.
+    /// Empty stdout or any failure leaves the input unchanged.
+    pub pre_tool_transform: Option<HookCommands>,
+    /// Max milliseconds to wait for each input transformer (default: 500).
+    pub pre_tool_transform_timeout_ms: u64,
     /// Runs when an agent turn begins (after the user message is added and
     /// before the model starts generating). Fires before the first `pre_tool`,
     /// so integrations can detect that the agent is actively working even while
@@ -941,9 +943,18 @@ pub struct HooksConfig {
     /// Env override: JCODE_HOOK_PRE_TOOL.
     pub pre_tool: Option<HookCommands>,
     /// Runs after each tool call completes.
-    /// Fields: TOOL_NAME, STATUS ("ok"/"error"), DURATION_MS, OUTPUT_BYTES.
+    /// Fields: TOOL_NAME, TOOL_CALL_ID, TOOL_INPUT, TOUCHED_PATHS, STATUS
+    /// ("ok"/"error"), DURATION_MS, OUTPUT_BYTES, ERROR.
     /// Env override: JCODE_HOOK_POST_TOOL.
     pub post_tool: Option<HookCommands>,
+    /// Synchronous hook after each successful tool call. Same fields as
+    /// post_tool, tool input JSON on stdin. Its stdout is appended to the tool
+    /// result the model sees (e.g. linter output for edited files).
+    /// Env override: JCODE_HOOK_POST_TOOL_FEEDBACK.
+    pub post_tool_feedback: Option<HookCommands>,
+    /// Max milliseconds to wait for each post_tool_feedback hook (default:
+    /// 10000). Env override: JCODE_HOOK_POST_TOOL_FEEDBACK_TIMEOUT_MS.
+    pub post_tool_feedback_timeout_ms: u64,
     /// Max milliseconds to wait for the pre_tool gate before failing open
     /// (default: 5000). Env override: JCODE_HOOK_PRE_TOOL_TIMEOUT_MS.
     pub pre_tool_timeout_ms: u64,
@@ -952,12 +963,16 @@ pub struct HooksConfig {
 impl Default for HooksConfig {
     fn default() -> Self {
         Self {
+            pre_tool_transform: None,
+            pre_tool_transform_timeout_ms: 500,
             turn_start: None,
             turn_end: None,
             session_start: None,
             session_end: None,
             pre_tool: None,
             post_tool: None,
+            post_tool_feedback: None,
+            post_tool_feedback_timeout_ms: 10_000,
             pre_tool_timeout_ms: 5000,
         }
     }
@@ -1034,6 +1049,10 @@ pub struct KeybindingsConfig {
     pub effort_increase: String,
     /// Effort decrease key (default: "cmd+left" on macOS, "alt+left" elsewhere)
     pub effort_decrease: String,
+    /// Speed tier increase key, Standard -> Fast -> Ultrafast (default: "alt+up")
+    pub speed_increase: String,
+    /// Speed tier decrease key, Ultrafast -> Fast -> Standard (default: "alt+down")
+    pub speed_decrease: String,
     /// Centered mode toggle key (default: "alt+c")
     pub centered_toggle: String,
     /// Scroll to previous prompt key (default: "ctrl+[")
@@ -1062,10 +1081,14 @@ pub struct KeybindingsConfig {
     pub copy_selection_toggle: String,
     /// Toggle the diagram pane position (default: "alt+t")
     pub diagram_pane_toggle: String,
+    /// Show/hide the pinned diagram pane (default: "alt+shift+m")
+    pub diagram_pane_visibility_toggle: String,
     /// Toggle typing scroll lock (default: "alt+s")
     pub typing_scroll_lock_toggle: String,
-    /// Cycle inline diff display mode (default: "alt+g")
+    /// Cycle inline diff display mode (default: unbound; use /diff)
     pub diff_mode_cycle: String,
+    /// Show the git commit log of the current project (default: "alt+g")
+    pub commit_log: String,
     /// Toggle the info widget (default: "alt+i")
     pub info_widget_toggle: String,
     /// Show/dismiss the session todo list as an inline card in the chat
@@ -1082,6 +1105,9 @@ pub struct KeybindingsConfig {
     /// Open the `/resume` session picker (default: "cmd+b" on macOS, "alt+r"
     /// elsewhere). Set "" to disable.
     pub open_resume: String,
+    /// Start/stop built-in voice input (default: "ctrl+space"). Speech streams
+    /// to Nari and the transcript is sent as a prompt. Set "" to disable.
+    pub voice_input: String,
     /// Session picker Enter action: "current-terminal" (default) or "new-terminal".
     /// Ctrl+Enter performs the alternate action.
     pub session_picker_enter: SessionPickerResumeAction,
@@ -1106,6 +1132,8 @@ impl Default for KeybindingsConfig {
             fallback_switch: get("fallback_switch", "ctrl+y"),
             effort_increase: get("effort_increase", "alt+right"),
             effort_decrease: get("effort_decrease", "alt+left"),
+            speed_increase: get("speed_increase", "alt+up"),
+            speed_decrease: get("speed_decrease", "alt+down"),
             centered_toggle: get("centered_toggle", "alt+c"),
             scroll_prompt_up: get("scroll_prompt_up", "ctrl+["),
             scroll_prompt_down: get("scroll_prompt_down", "ctrl+]"),
@@ -1120,8 +1148,10 @@ impl Default for KeybindingsConfig {
             side_panel_toggle: get("side_panel_toggle", "alt+m"),
             copy_selection_toggle: get("copy_selection_toggle", "alt+y"),
             diagram_pane_toggle: get("diagram_pane_toggle", "alt+t"),
+            diagram_pane_visibility_toggle: get("diagram_pane_visibility_toggle", "alt+shift+m"),
             typing_scroll_lock_toggle: get("typing_scroll_lock_toggle", "alt+s"),
-            diff_mode_cycle: get("diff_mode_cycle", "alt+g"),
+            diff_mode_cycle: get("diff_mode_cycle", ""),
+            commit_log: get("commit_log", "alt+g"),
             info_widget_toggle: get("info_widget_toggle", "alt+i"),
             todo_card_toggle: get("todo_card_toggle", "alt+x"),
             swarm_panel_focus: get("swarm_panel_focus", "alt+n"),
@@ -1134,6 +1164,7 @@ impl Default for KeybindingsConfig {
                     "alt+r"
                 },
             ),
+            voice_input: get("voice_input", "ctrl+space"),
             session_picker_enter: SessionPickerResumeAction::CurrentTerminal,
         }
     }
@@ -1221,6 +1252,14 @@ pub enum WebSearchEngine {
     /// `JCODE_SEARXNG_URL` env var) to point at a SearXNG instance. Useful on
     /// hosts where DuckDuckGo/Bing block the request via TLS fingerprinting.
     Searxng,
+    /// User-configured HTTP JSON endpoint.
+    Custom,
+    /// Provider-native server-side search (Anthropic `web_search`, OpenAI
+    /// Responses `web_search`). Search runs on the model provider's side, so it
+    /// works on hosts where scraping is blocked and needs no extra API key.
+    /// When the active provider/model does not support it, the local
+    /// `websearch` tool is used with `fallback_engines` instead.
+    Native,
 }
 
 impl WebSearchEngine {
@@ -1229,6 +1268,8 @@ impl WebSearchEngine {
             Self::Duckduckgo => "duckduckgo",
             Self::Bing => "bing",
             Self::Searxng => "searxng",
+            Self::Custom => "custom",
+            Self::Native => "native",
         }
     }
 
@@ -1237,7 +1278,64 @@ impl WebSearchEngine {
             "duckduckgo" | "ddg" => Some(Self::Duckduckgo),
             "bing" => Some(Self::Bing),
             "searxng" | "searx" => Some(Self::Searxng),
+            "custom" => Some(Self::Custom),
+            "native" | "provider" => Some(Self::Native),
             _ => None,
+        }
+    }
+
+    /// True for engines the local `websearch` tool can run itself.
+    pub fn is_local(self) -> bool {
+        !matches!(self, Self::Native)
+    }
+}
+
+/// HTTP method for a custom JSON search endpoint.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CustomWebSearchMethod {
+    #[default]
+    #[serde(rename = "GET", alias = "get")]
+    Get,
+    #[serde(rename = "POST", alias = "post")]
+    Post,
+}
+
+/// Configurable HTTP JSON search. Pointers use RFC 6901 syntax.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomWebSearchConfig {
+    pub endpoint: String,
+    pub method: CustomWebSearchMethod,
+    pub query_param: String,
+    pub count_param: Option<String>,
+    /// Static URL query parameters for either method.
+    pub params: std::collections::BTreeMap<String, String>,
+    /// Static JSON object for POST requests.
+    pub body: serde_json::Value,
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Header name to environment variable containing its complete value.
+    pub header_env: std::collections::BTreeMap<String, String>,
+    pub results_pointer: String,
+    pub title_pointer: String,
+    pub url_pointer: String,
+    pub snippet_pointer: String,
+}
+
+impl Default for CustomWebSearchConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            method: CustomWebSearchMethod::Get,
+            query_param: "q".into(),
+            count_param: None,
+            params: Default::default(),
+            body: serde_json::json!({}),
+            headers: Default::default(),
+            header_env: Default::default(),
+            results_pointer: "/results".into(),
+            title_pointer: "/title".into(),
+            url_pointer: "/url".into(),
+            snippet_pointer: "/snippet".into(),
         }
     }
 }
@@ -1246,6 +1344,8 @@ impl WebSearchEngine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebSearchConfig {
+    /// HTTP JSON provider configuration for engine = "custom".
+    pub custom: Option<CustomWebSearchConfig>,
     /// Preferred engine when the tool input does not specify one.
     pub engine: WebSearchEngine,
     /// Keyless HTML engines to try after the preferred engine fails.
@@ -1262,11 +1362,32 @@ pub struct WebSearchConfig {
     pub searxng_url: Option<String>,
     /// Environment variable containing the SearXNG base URL.
     pub searxng_url_env: String,
+    /// Prefer the model provider's own server-side search whenever the active
+    /// provider/model supports it (Anthropic first-party API, OpenAI
+    /// Responses). The local `websearch` tool is then replaced by the hosted
+    /// one. Providers without native search keep the local tool and `engine`.
+    /// Default true. `engine = "native"` also turns this on.
+    pub prefer_native: bool,
+    /// Maximum provider-native searches per request.
+    /// Anthropic bills roughly $10 per 1,000 searches on API keys, so this caps
+    /// spend. Anthropic only; OpenAI has no per-request cap.
+    pub native_max_uses: Option<u32>,
+    /// Restrict provider-native search to these domains. Mutually exclusive
+    /// with `native_blocked_domains` (Anthropic rejects both).
+    pub native_allowed_domains: Vec<String>,
+    /// Never return results from these domains (Anthropic only).
+    pub native_blocked_domains: Vec<String>,
+    /// Anthropic server tool version, e.g. "web_search_20250305" (default) or
+    /// "web_search_20260209". Newer versions are sent with
+    /// `allowed_callers = ["direct"]` so models without programmatic tool
+    /// calling are not rejected.
+    pub native_anthropic_tool_version: String,
 }
 
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
+            custom: None,
             engine: WebSearchEngine::Duckduckgo,
             fallback_engines: vec![WebSearchEngine::Bing],
             bing_api_key: None,
@@ -1274,7 +1395,24 @@ impl Default for WebSearchConfig {
             bing_market: "en-US".to_string(),
             searxng_url: None,
             searxng_url_env: "JCODE_SEARXNG_URL".to_string(),
+            prefer_native: true,
+            native_max_uses: Some(DEFAULT_NATIVE_WEB_SEARCH_MAX_USES),
+            native_allowed_domains: Vec::new(),
+            native_blocked_domains: Vec::new(),
+            native_anthropic_tool_version: DEFAULT_ANTHROPIC_WEB_SEARCH_TOOL.to_string(),
         }
+    }
+}
+
+/// Default cap on provider-native searches per request.
+pub const DEFAULT_NATIVE_WEB_SEARCH_MAX_USES: u32 = 5;
+/// Default Anthropic web search server tool version.
+pub const DEFAULT_ANTHROPIC_WEB_SEARCH_TOOL: &str = "web_search_20250305";
+
+impl WebSearchConfig {
+    /// True when provider-native search should be used where available.
+    pub fn native_enabled(&self) -> bool {
+        self.prefer_native || self.engine == WebSearchEngine::Native
     }
 }
 
@@ -1570,29 +1708,6 @@ impl Default for GatewayConfig {
             enabled: false,
             port: 7643,
             bind_addr: "0.0.0.0".to_string(),
-        }
-    }
-}
-
-/// Power-management configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PowerConfig {
-    /// Prevent automatic system sleep while any jcode session is actively
-    /// streaming/processing. Linux also asks logind to block lid-switch suspend.
-    /// Windows cannot override a user-initiated lid close or power-button action;
-    /// those remain controlled by the active Windows power plan. The display is
-    /// still allowed to sleep. Default: true.
-    ///
-    /// Honored by the shared `jcode serve` daemon. The `JCODE_DISABLE_POWER_INHIBIT`
-    /// environment variable forces this off regardless of the config value.
-    pub prevent_sleep_while_streaming: bool,
-}
-
-impl Default for PowerConfig {
-    fn default() -> Self {
-        Self {
-            prevent_sleep_while_streaming: true,
         }
     }
 }

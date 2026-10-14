@@ -14,12 +14,14 @@ pub(super) use super::commands_review::queue_autojudge_remote;
 pub(super) use super::commands_review::{
     ImproveCommand, ManualSubagentSpec, RefactorCommand, autojudge_status_message,
     autoreview_status_message, build_autojudge_startup_message, build_autoreview_startup_message,
-    build_judge_startup_message, build_review_startup_message, current_feedback_target_session_id,
-    handle_autojudge_command_local, handle_autoreview_command_local, handle_judge_command_local,
-    handle_observe_command, handle_review_command_local, launch_forked_session_local,
-    launch_prompt_in_new_session_local, maybe_trigger_autojudge_local,
-    maybe_trigger_autoreview_local, preferred_one_shot_review_override,
-    prepare_review_spawned_session, queue_review_spawn_remote, reset_current_session,
+    build_judge_startup_message, build_review_startup_message, current_autojudge_model_override,
+    current_autoreview_model_override, current_feedback_target_session_id,
+    current_judge_model_override, current_review_model_override, handle_autojudge_command_local,
+    handle_autoreview_command_local, handle_judge_command_local, handle_observe_command,
+    handle_review_command_local, launch_forked_session_local, launch_prompt_in_new_session_local,
+    maybe_trigger_autojudge_local, maybe_trigger_autoreview_local,
+    preferred_one_shot_review_override, prepare_review_spawned_session, queue_review_spawn_remote,
+    reset_current_session,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
 use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
@@ -366,6 +368,7 @@ pub(super) fn create_transfer_session_from_parent(
     let mut child = crate::session::Session::create(Some(parent_session_id.to_string()), None);
     child.messages.clear();
     child.compaction = compaction;
+    child.system_prompt = parent.system_prompt.clone();
     child.working_dir = parent.working_dir.clone();
     child.model = parent.model.clone();
     child.provider_key = parent.provider_key.clone();
@@ -1683,6 +1686,12 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if super::commands_cloud::parse_cloud_command(trimmed).is_some() {
+        let session_id = active_session_id(app);
+        super::commands_cloud::handle_cloud_command(app, trimmed, &session_id);
+        return true;
+    }
+
     if trimmed == "/commit" {
         handle_commit_command_local(app);
         return true;
@@ -1690,6 +1699,11 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if trimmed == "/merge" {
         handle_merge_command_local(app);
+        return true;
+    }
+
+    if trimmed == "/merge-remote-release" {
+        handle_merge_remote_release_command_local(app);
         return true;
     }
 
@@ -2177,6 +2191,25 @@ pub(super) fn build_merge_prompt() -> String {
     )
 }
 
+pub(super) fn build_merge_remote_release_prompt() -> String {
+    format!(
+        "Merge the current branch and then cut a remote release from the destination branch. Execute these two phases in order. \
+        Phase 1 (merge only, no push or release): {} \
+        Gate: proceed to Phase 2 only after Phase 1 successfully merges the source and all post-merge validation passes, \
+        HEAD is attached to the selected destination, the worktree is clean, and the recorded source commit is an ancestor of HEAD. \
+        If Phase 1 stops for any reason (including already being on the destination branch), has conflicts, fails validation, \
+        or needs clarification, stop the entire workflow without pushing, tagging, or releasing. \
+        The no-push rule and nothing-pushed report above apply to Phase 1 only. \
+        Phase 2 (remote release): stay on the verified destination branch and release its merged HEAD, never the original feature branch. \
+        Do not auto-commit any unexpected work that appears between phases. Stop if the destination branch or HEAD changes unexpectedly. \
+        Stop on any push failure before creating a tag or triggering a release. {} \
+        Finally report the merge source and destination, validation results, release version, push result, and remote release status. \
+        Distinguish a triggered remote workflow from a completed publication.",
+        build_merge_prompt(),
+        build_remote_release_prompt(),
+    )
+}
+
 pub(super) fn build_commit_prompt() -> String {
     "Make interactive, logical commits for the current uncommitted work. Inspect the git state first, including unstaged and staged changes. Group related changes into small coherent commits, staging only the files or hunks that belong together. Preserve unrelated user or agent work, do not discard changes, and do not amend existing commits unless clearly necessary. For each commit, use a concise conventional-style message when possible. Validate as appropriate for the changed files before committing, and report the commits created plus any remaining uncommitted changes.".to_string()
 }
@@ -2324,6 +2357,14 @@ pub(super) fn fast_macos_release_launch_notice(interrupted: bool) -> String {
     }
 }
 
+pub(super) fn merge_remote_release_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting merge + push + remote release...".to_string()
+    } else {
+        "🚀 Starting merge + push + remote release...".to_string()
+    }
+}
+
 pub(super) fn remote_release_launch_notice(interrupted: bool) -> String {
     if interrupted {
         "👉 Interrupting and starting logical commits + push + remote release...".to_string()
@@ -2388,6 +2429,23 @@ fn handle_fast_macos_release_command_local(app: &mut App) {
         );
     } else {
         app.push_display_message(DisplayMessage::system(fast_macos_release_launch_notice(
+            false,
+        )));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_merge_remote_release_command_local(app: &mut App) {
+    let prompt = build_merge_remote_release_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /merge-remote-release...",
+            merge_remote_release_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(merge_remote_release_launch_notice(
             false,
         )));
         super::commands_improve::start_synthetic_user_turn(app, prompt);
@@ -2807,6 +2865,18 @@ pub(super) fn active_working_dir(app: &App) -> Option<std::path::PathBuf> {
 }
 
 pub(super) fn handle_dictation_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed == "/voice" {
+        app.toggle_voice_input();
+        return true;
+    }
+    if trimmed.starts_with("/voice ") {
+        let key = app.voice_input_key_label().unwrap_or("unbound").to_string();
+        app.push_display_message(DisplayMessage::error(format!(
+            "Usage: /voice (or {key}) starts recording, run it again to send, Esc cancels.\n\
+             Needs a Nari API key (NARI_API_KEY or ~/.config/jcode/nari.env)."
+        )));
+        return true;
+    }
     if trimmed == "/dictate" || trimmed == "/dictation" {
         app.handle_dictation_trigger();
         return true;
@@ -3126,7 +3196,29 @@ fn run_interactive_editor_with(
     resume: impl FnOnce(),
 ) -> std::io::Result<std::process::ExitStatus> {
     suspend();
+    // Publish only after the restores completed. The flag must never be
+    // observable while jcode's own modes are still armed: a termination
+    // signal firing mid-suspend would skip its cleanup and leave the shell in
+    // raw mode (greptile #4230626960). While the disable writes are in flight
+    // the flag is still false, so a signal in that window restores everything;
+    // the flag is then published under the same kitty state lock the signal
+    // cleanup takes, so cleanup either sees the completed handoff or runs in
+    // full.
+    crate::tui::publish_editor_terminal_handoff();
     let result = command.status();
+    // Reclaim before resume re-arms our modes: while the flag is still set a
+    // termination signal skips its cleanup, which must only happen while the
+    // editor really is the one controlling the tty.
+    crate::tui::reclaim_editor_terminal_handoff();
+    // A termination signal that skipped its cleanup while the editor owned
+    // the terminal recorded termination under the kitty state lock before
+    // this reclaim ran, and the process is exiting. The reclaim leaves
+    // ownership set in that case; re-arming modes now would leave them
+    // enabled on the shell after death because no further cleanup runs
+    // (greptile #4232838288), so skip the resume entirely.
+    if crate::tui::editor_owns_terminal() {
+        return result;
+    }
     resume();
     result
 }
@@ -3134,6 +3226,10 @@ fn run_interactive_editor_with(
 fn suspend_terminal_for_editor() {
     use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
 
+    // The caller publishes the handoff only after this function returns, so a
+    // termination signal firing between these restores and the publication
+    // runs a full cleanup instead of skipping one (greptile #4230626960).
+    //
     // These commands are safe even when a mode was not enabled. Disable them
     // before leaving the alternate screen so the child receives normal input.
     let _ = crossterm::execute!(
@@ -3149,6 +3245,15 @@ fn suspend_terminal_for_editor() {
 fn resume_terminal_after_editor() {
     use crossterm::event::{EnableBracketedPaste, EnableFocusChange, EnableMouseCapture};
 
+    // Defense in depth for the run_interactive_editor_with early return: a
+    // termination signal already recorded that the process is exiting, so
+    // enabling modes here would leave them active on the shell after death
+    // (greptile #4232838288).
+    if crate::tui::editor_owns_terminal() {
+        return;
+    }
+    // The caller reclaimed the handoff before entering here, so a termination
+    // signal arriving while these modes are re-armed runs the full cleanup.
     // Re-enter the TUI before returning to the event loop. The existing
     // ratatui Terminal remains usable and the next loop iteration redraws it.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ratatui::init));
@@ -3170,9 +3275,15 @@ mod interactive_editor_tests {
     use super::run_interactive_editor_with;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn handoff_waits_for_editor_before_resuming_terminal() {
+        let _guard = crate::tui::TERMINAL_OWNERSHIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        crate::tui::set_editor_terminal_ownership(false);
         let events = Rc::new(RefCell::new(Vec::new()));
         let child_events = Rc::clone(&events);
         let mut command = std::process::Command::new("sh");
@@ -3201,6 +3312,10 @@ mod interactive_editor_tests {
 
     #[test]
     fn handoff_resumes_terminal_after_editor_failure_status() {
+        let _guard = crate::tui::TERMINAL_OWNERSHIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        crate::tui::set_editor_terminal_ownership(false);
         let resumed = Rc::new(RefCell::new(false));
         let resumed_after = Rc::clone(&resumed);
         let mut command = std::process::Command::new("sh");
@@ -3217,6 +3332,145 @@ mod interactive_editor_tests {
 
         assert_eq!(status.code(), Some(7));
         assert!(*resumed.borrow());
+        assert!(!crate::tui::editor_owns_terminal());
+    }
+
+    #[test]
+    fn handoff_clears_editor_terminal_ownership_when_command_fails_to_launch() {
+        let _guard = crate::tui::TERMINAL_OWNERSHIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        crate::tui::set_editor_terminal_ownership(false);
+        let mut command = std::process::Command::new("/definitely/missing/jcode-editor-test");
+
+        let result = run_interactive_editor_with(&mut command, || {}, || {});
+
+        assert!(result.is_err());
+        assert!(!crate::tui::editor_owns_terminal());
+    }
+
+    #[test]
+    fn handoff_publishes_ownership_only_while_editor_runs() {
+        let _guard = crate::tui::TERMINAL_OWNERSHIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        crate::tui::set_editor_terminal_ownership(false);
+        let saw_ownership = Arc::new(AtomicBool::new(false));
+        let owns_during_resume = Rc::new(RefCell::new(true));
+
+        // The child stays alive until the sampler confirms the flag, so a busy
+        // runner delaying the sampler cannot shrink the observation window
+        // below what the sampler needs (greptile #4231010584). With a fixed
+        // child sleep the test failed on correct code whenever the sampler
+        // started late. The child gives up after ~5s so broken code that never
+        // publishes still fails the assertions instead of hanging.
+        let sentinel = std::env::temp_dir().join(format!(
+            "jcode-editor-ownership-{}-{}.sentinel",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&sentinel);
+
+        let sampler_sentinel = Arc::clone(&saw_ownership);
+        let sampler_saw = sentinel.clone();
+        let sampler = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if crate::tui::editor_owns_terminal() {
+                    sampler_sentinel.store(true, Ordering::SeqCst);
+                    let _ = std::fs::write(&sampler_saw, b"");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .env("JCODE_OWNERSHIP_SENTINEL", &sentinel)
+            .args([
+                "-c",
+                "i=0; while [ ! -f \"$JCODE_OWNERSHIP_SENTINEL\" ] && [ \"$i\" -lt 500 ]; do sleep 0.01; i=$((i+1)); done; [ -f \"$JCODE_OWNERSHIP_SENTINEL\" ]",
+            ]);
+        let owns_during_resume_after = Rc::clone(&owns_during_resume);
+        let status = run_interactive_editor_with(
+            &mut command,
+            // The restores are still in flight here: the flag must stay false
+            // so a termination signal in this window cleans up in full instead
+            // of skipping it and leaving the shell in raw mode (greptile
+            // #4230626960).
+            || assert!(!crate::tui::editor_owns_terminal()),
+            move || *owns_during_resume_after.borrow_mut() = crate::tui::editor_owns_terminal(),
+        )
+        .expect("shell should launch");
+
+        sampler.join().expect("sampler thread");
+        let _ = std::fs::remove_file(&sentinel);
+
+        // Exit 0 means the sampler confirmed ownership while the child was
+        // still alive; a nonzero exit means the child gave up waiting, which
+        // only happens when the flag was never published.
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "editor exited before the sampler observed ownership"
+        );
+        assert!(
+            saw_ownership.load(Ordering::SeqCst),
+            "ownership was never published while the editor ran"
+        );
+        // Reclaimed before resume re-armed jcode's modes.
+        assert!(!*owns_during_resume.borrow());
+        assert!(!crate::tui::editor_owns_terminal());
+    }
+
+    #[test]
+    fn reclaim_resume_does_not_reenable_modes_after_termination_started() {
+        let _guard = crate::tui::TERMINAL_OWNERSHIP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        crate::tui::set_editor_terminal_ownership(false);
+
+        // Greptile #4232838288: reproduce the race window. The signal cleanup
+        // saw the editor handoff, skipped its restore, recorded termination
+        // under the kitty state lock, and released the lock while the process
+        // was still alive. The editor then exited before the process did, so
+        // this reclaim runs inside that gap and must not let the resume
+        // re-arm modes that no later cleanup would ever disable again.
+        crate::tui::publish_editor_terminal_handoff();
+        crate::tui::record_termination_started();
+
+        let resumed = Rc::new(RefCell::new(false));
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let resumed_after = Rc::clone(&resumed);
+        let status = run_interactive_editor_with(
+            &mut command,
+            || {},
+            move || {
+                *resumed_after.borrow_mut() = true;
+            },
+        )
+        .expect("shell should launch");
+
+        assert!(status.success());
+        // The reclaim refused while terminating, so ownership stays published
+        // and the resume that re-arms every mode never runs.
+        assert!(
+            crate::tui::editor_owns_terminal(),
+            "reclaim cleared ownership while termination had already started"
+        );
+        assert!(
+            !*resumed.borrow(),
+            "resume re-armed terminal modes after termination started"
+        );
+        // A late keyboard push is refused too, so no entry is left unpopped
+        // for the shell to inherit.
+        assert!(!crate::tui::enable_keyboard_enhancement());
+
+        // Restore the process-global flags for the other tests in this binary.
+        crate::tui::set_editor_terminal_ownership(false);
+        crate::tui::reset_termination_started_for_test();
     }
 }
 
@@ -3226,6 +3480,12 @@ pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     let rest = trimmed.strip_prefix("/agents").unwrap_or_default().trim();
+    let (global, rest) = match rest.split_once(' ') {
+        Some(("global" | "default", tail)) => (true, tail.trim()),
+        _ if matches!(rest, "global" | "default") => (true, ""),
+        _ => (false, rest),
+    };
+    app.agent_models_global_scope = global;
     if rest.is_empty() {
         app.open_agents_picker();
         return true;
@@ -3233,7 +3493,7 @@ pub(super) fn handle_agents_command(app: &mut App, trimmed: &str) -> bool {
 
     let Some(target) = parse_agents_target(rest) else {
         app.push_display_message(DisplayMessage::error(
-            "Usage: /agents or /agents <swarm|review|judge|memory|ambient>".to_string(),
+            "Usage: /agents [default|global] [swarm|review|judge|memory|ambient]".to_string(),
         ));
         return true;
     };
